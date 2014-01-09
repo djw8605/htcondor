@@ -100,6 +100,7 @@ include (SrcTargetRef)
 include (DumpLocalFlags)
 include (CondorPreExternal)
 include (CondorPostExternal)
+include (CheckLinkerFlags)
 include (CondorConfigure)     # will initiate the configure
 include (TarGz) # Must be after include(CondorPackageConfig)
 

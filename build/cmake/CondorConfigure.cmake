@@ -551,6 +551,36 @@ if (NOT EXISTS ${EXTERNAL_STAGE})
 	file ( MAKE_DIRECTORY ${EXTERNAL_STAGE} )
 endif()
 
+# I'd like this to apply to classads build as well, so I put it
+# above the addition of the .../src/classads subdir:
+if (NOT MSVC)
+        check_cxx_linker_flag("-Wl,-z,relro" cxx_wl_z_relro)
+        check_cxx_linker_flag("-Wl,-z,bind_now" cxx_wl_z_bind_now)
+        check_cxx_linker_flag("-Wl,-z,now" cxx_wl_z_now)
+        check_cxx_compiler_flag(-fPIE cxx_fpie)
+
+        # partial relro support:
+        if (cxx_wl_z_relro)
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,relro")
+            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}  -Wl,-z,relro")
+        endif()
+
+        # full relro support:
+        if (cxx_wl_z_now)
+            set(cxx_full_relro 1)
+            set(cxx_full_relro_arg "-Wl,-z,now")
+        elseif (cxx_wl_z_bind_now)
+            set(cxx_full_relro 1)
+            set(cxx_full_relro_arg "-Wl,-z,bind_now")
+        endif()
+
+        # compiling with -fPIC is important for PIE
+        if (cxx_fpie)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+        endif()
+endif()
+
+
 ###########################################
 #if (NOT MSVC11) 
 add_subdirectory(${CONDOR_EXTERNAL_DIR}/bundles/boost/1.49.0)

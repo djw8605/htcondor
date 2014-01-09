@@ -1,6 +1,6 @@
  ###############################################################
  # 
- # Copyright 2011 Red Hat, Inc. 
+ # Copyright 2014 Red Hat, Inc. 
  # 
  # Licensed under the Apache License, Version 2.0 (the "License"); you 
  # may not use this file except in compliance with the License.  You may 
@@ -16,21 +16,13 @@
  # 
  ############################################################### 
 
-MACRO (APPEND_VAR _VAR _VAL)
-
-	if(${_VAR})
-		set (${_VAR} "${${_VAR}};${_VAL}")
-	else(${_VAR})
-		set (${_VAR} ${_VAL})
-	endif(${_VAR})
-
-	set (${_VAR} ${${_VAR}} PARENT_SCOPE )
-
-ENDMACRO(APPEND_VAR)
-
-
-macro(append_target_property_flag _target _property _flag)
-    get_property(_val TARGET ${_target} PROPERTY ${_property})
-    set(_val "${_val} ${_flag}")
-    set_target_properties(${_target} PROPERTIES ${_property} ${_val})
-endmacro(append_target_property_flag)
+macro(check_cxx_linker_flag _flag _var)
+    # This function is encapsulated voodo, although it appears to work correctly:
+    # http://www.cmake.org/pipermail/cmake/2011-July/045525.html
+    # If there is better standardized support for linker flag checking,
+    # we should consider using that instead.
+    set(_save_req ${CMAKE_REQUIRED_FLAGS})
+    set(CMAKE_REQUIRED_FLAGS ${_flag})
+    check_cxx_compiler_flag("" ${_var})
+    set(CMAKE_REQUIRED_FLAGS ${_save_req})
+endmacro(check_cxx_linker_flag)
