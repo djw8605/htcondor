@@ -17,12 +17,21 @@
  ############################################################### 
 
 macro(check_cxx_linker_flag _flag _var)
-    # This function is encapsulated voodo, although it appears to work correctly:
-    # http://www.cmake.org/pipermail/cmake/2011-July/045525.html
-    # If there is better standardized support for linker flag checking,
-    # we should consider using that instead.
-    set(_save_req ${CMAKE_REQUIRED_FLAGS})
-    set(CMAKE_REQUIRED_FLAGS ${_flag})
-    check_cxx_compiler_flag("" ${_var})
-    set(CMAKE_REQUIRED_FLAGS ${_save_req})
+    message("Performing Test ${_var}")        
+    unset(${_var})
+
+    set(_stub_code "int main() { return 0; }")
+
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/build/cmake/stub_code.cpp "${_stub_code}\n")
+
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} ${_flag} ${CMAKE_CURRENT_BINARY_DIR}/build/cmake/stub_code.cpp
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/build/cmake
+                    ERROR_VARIABLE _stderr)
+
+    if (NOT _stderr)
+        message("Performing Test ${_var} - Success")
+        set(${_var} 1)
+    else()
+        message("Performing Test ${_var} - Failed")
+    endif()
 endmacro(check_cxx_linker_flag)
