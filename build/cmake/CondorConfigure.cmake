@@ -554,6 +554,15 @@ endif()
 # I'd like this to apply to classads build as well, so I put it
 # above the addition of the .../src/classads subdir:
 if (NOT MSVC)
+        message("\ncmake version:  ${CMAKE_VERSION}")
+        execute_process(COMMAND ${CMAKE_CXX_COMPILER} --version
+                        OUTPUT_VARIABLE _cxx_ver)
+        message("\ngcc version: ${_cxx_ver}")
+        execute_process(COMMAND ${CMAKE_CXX_COMPILER} -Wl,--version
+                        OUTPUT_VARIABLE _ld_ver)
+        message("\ngcc version: ${_ld_ver}")
+        glibc_detect(_glibc_ver)
+        message("\nglibc version: ${_glibc_ver}")
         check_cxx_linker_flag("-Wl,-z,relro" cxx_wl_z_relro)
         check_cxx_linker_flag("-Wl,-z,bind_now" cxx_wl_z_bind_now)
         check_cxx_linker_flag("-Wl,-z,now" cxx_wl_z_now)
