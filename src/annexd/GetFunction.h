@@ -6,7 +6,7 @@
 // #include "classad_collection.h"
 // #include "gahp-client.h"
 // #include "Functor.h"
-// #include "PutTargets.h"
+// #include "GetFunction.h"
 
 class GetFunction : public Functor {
 	public:

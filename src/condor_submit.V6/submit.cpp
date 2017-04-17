@@ -77,7 +77,7 @@
 #include "NegotiationUtils.h"
 #include <submit_utils.h>
 //uncomment this to have condor_submit use the new for 8.5 submit_utils classes
-//#define USE_SUBMIT_UTILS 1
+#define USE_SUBMIT_UTILS 1
 #include "submit_internal.h"
 
 #include "list.h"
@@ -208,6 +208,9 @@ bool    nice_user_setting = false;
 bool	NewExecutable = false;
 #ifdef USE_SUBMIT_UTILS
 int		dash_remote=0;
+int		dash_factory=0;
+int		default_to_factory=0;
+unsigned int submit_unique_id=1; // hack to make default_to_factory work in test suite for milestone 1 (8.7.1)
 #else
 bool	IsFirstExecutable;
 bool	UserLogSpecified = false;
@@ -810,6 +813,7 @@ char *myproxy_password = NULL;
 #endif
 
 int  SendJobCredential();
+void SetSendCredentialInAd( ClassAd *job_ad );
 
 extern DLL_IMPORT_MAGIC char **environ;
 
@@ -818,24 +822,7 @@ int SetSyscalls( int foo );
 int DoCleanup(int,int,const char*);
 }
 
-
-// global struct that we use to keep track of where we are so we
-// can give useful error messages.
-enum {
-	PHASE_INIT=0,       // before we begin reading from the submit file
-	PHASE_READ_SUBMIT,  // while reading the submit file, and not on a Queue line
-	PHASE_DASH_APPEND,  // while processing -a arguments (happens when we see the Queue line)
-	PHASE_QUEUE,        // while processing the Queue line from a submit file
-	PHASE_QUEUE_ARG,    // while processing the -queue argument
-	PHASE_COMMIT,       // after processing the submit file/arguments
-};
-struct SubmitErrContext {
-	int phase;          // one of PHASE_xxx enum
-	int step;           // set to Step loop variable during queue iteration
-	int item_index;     // set to itemIndex/Row loop variable during queue iteration
-	const char * macro_name; // set to macro name during submit hashtable lookup/expansion
-	const char * raw_macro_val; // set to raw macro value during submit hashtable expansion
-} ErrContext = { PHASE_INIT, -1, -1, NULL, NULL };
+struct SubmitErrContext ErrContext = { PHASE_INIT, -1, -1, NULL, NULL };
 
 // this will get called when the condor EXCEPT() macro is invoked.
 // for the most part, we want to report the message, but to use submit file and
@@ -876,6 +863,17 @@ ExtArray <ClassAd*> JobAdsArray(100);
 int JobAdsArrayLen = 0;
 #ifdef USE_SUBMIT_UTILS
 int JobAdsArrayLastClusterIndex = 0;
+
+// called by the factory submit to fill out the data structures that
+// we use to print out the standard messages on complection.
+void set_factory_submit_info(int cluster, int num_procs)
+{
+	CurrentSubmitInfo++;
+	SubmitInfo[CurrentSubmitInfo].cluster = cluster;
+	SubmitInfo[CurrentSubmitInfo].firstjob = 0;
+	SubmitInfo[CurrentSubmitInfo].lastjob = num_procs-1;
+}
+
 #else
 
 // explicit template instantiations
@@ -1097,6 +1095,22 @@ void TestFilePermissions( char *scheddAddr = NULL )
 }
 
 #ifdef USE_SUBMIT_UTILS
+void print_errstack(FILE* out, CondorError *errstack)
+{
+	if ( ! errstack)
+		return;
+
+	for (/*nothing*/ ; ! errstack->empty(); errstack->pop()) {
+		int code = errstack->code();
+		std::string msg(errstack->message());
+		if (msg.size() && msg[msg.size()-1] != '\n') { msg += '\n'; }
+		if (code) {
+			fprintf(out, "ERROR: %s", msg.c_str());
+		} else {
+			fprintf(out, "WARNING: %s", msg.c_str());
+		}
+	}
+}
 #else
 void
 init_job_ad()
@@ -1279,6 +1293,8 @@ main( int argc, const char *argv[] )
 	init_params();
 #ifdef USE_SUBMIT_UTILS
 	submit_hash.init();
+
+	default_to_factory = param_boolean("SUBMIT_FACTORY_JOBS_BY_DEFAULT", default_to_factory);
 #endif
 
 		// If our effective and real gids are different (b/c the
@@ -1336,6 +1352,9 @@ main( int argc, const char *argv[] )
 
 			} else if (is_dash_arg_prefix(ptr[0], "spool", 1)) {
 				dash_remote++;
+				DisableFileChecks = 1;
+			} else if (is_dash_arg_prefix(ptr[0], "factory", 1)) {
+				dash_factory++;
 				DisableFileChecks = 1;
 			} else if (is_dash_arg_prefix(ptr[0], "address", 2)) {
 				if( !(--argc) || !(*(++ptr)) ) {
@@ -1579,7 +1598,7 @@ main( int argc, const char *argv[] )
 	}
 
 	if (!DisableFileChecks) {
-		DisableFileChecks = param_boolean_crufty("SUBMIT_SKIP_FILECHECKS", false) ? 1 : 0;
+		DisableFileChecks = param_boolean_crufty("SUBMIT_SKIP_FILECHECKS", true) ? 1 : 0;
 	}
 
 	MaxProcsPerCluster = param_integer("SUBMIT_MAX_PROCS_IN_CLUSTER", 0, 0);
@@ -1685,6 +1704,20 @@ main( int argc, const char *argv[] )
 		exit(1);
 	}
 
+	bool has_late_materialize = false;
+	CondorVersionInfo cvi(MySchedd ? MySchedd->version() : CondorVersion());
+	if (cvi.built_since_version(8,7,1)) {
+		has_late_materialize = true;
+		if ( ! DumpClassAdToFile && ! DashDryRun && ! dash_interactive && default_to_factory) { dash_factory = true; }
+	}
+	if (dash_factory && ! has_late_materialize) {
+		fprintf(stderr, "\nERROR: Schedd does not support late materialization\n");
+		exit(1);
+	} else if (dash_factory && dash_interactive) {
+		fprintf(stderr, "\nERROR: Interactive jobs cannot be materialized late\n");
+		exit(1);
+	}
+
 	// open submit file
 	if ( ! cmd_file || SubmitFromStdin) {
 		// no file specified, read from stdin
@@ -1701,8 +1734,9 @@ main( int argc, const char *argv[] )
 			exit(1);
 		}
 #ifdef USE_SUBMIT_UTILS
-		submit_hash.insert_source(cmd_file, FileMacroSource);
-		SubmitFileMacroDef.psz = const_cast<char*>(submit_hash.apool.insert(full_path(cmd_file, false)));
+		// this does both insert_source, and also gives a values to the default $(SUBMIT_FILE) expansion
+		submit_hash.insert_submit_filename(cmd_file, FileMacroSource);
+		submit_unique_id = hashFuncChars(cmd_file);
 #else
 		insert_source(cmd_file, SubmitMacroSet, FileMacroSource);
 		SubmitFileMacroDef.psz = const_cast<char*>(SubmitMacroSet.apool.insert(full_path(cmd_file, false)));
@@ -1738,8 +1772,14 @@ main( int argc, const char *argv[] )
 		}
 	}
 
+	int rval = 0;
 	//  Parse the file and queue the jobs
-	if( read_submit_file(fp) < 0 ) {
+	if (dash_factory && has_late_materialize) {
+		rval = submit_factory_job(fp, FileMacroSource, extraLines, queueCommandLine);
+	} else {
+		rval = read_submit_file(fp);
+	}
+	if( rval < 0 ) {
 		if( ExtraLineNo == 0 ) {
 			fprintf( stderr,
 					 "\nERROR: Failed to parse command file (line %d).\n",
@@ -1782,7 +1822,6 @@ main( int argc, const char *argv[] )
 
 	ErrContext.phase = PHASE_COMMIT;
 
-	// in verbose mode we will have already printed out cluster and proc
 	if ( ! verbose && ! DumpFileIsStdout) {
 		if (terse) {
 			int ixFirst = 0;
@@ -1817,7 +1856,14 @@ main( int argc, const char *argv[] )
 
 	ActiveQueueConnection = FALSE; 
 
-	if ( !DisableFileChecks ) {
+    bool isStandardUni = false;
+#ifdef USE_SUBMIT_UTILS
+	isStandardUni = submit_hash.getUniverse() == CONDOR_UNIVERSE_STANDARD;
+#else
+	isStandardUni = JobUniverse == CONDOR_UNIVERSE_STANDARD;
+#endif
+
+	if ( !DisableFileChecks || isStandardUni) {
 		TestFilePermissions( MySchedd->addr() );
 	}
 
@@ -1931,6 +1977,9 @@ main( int argc, const char *argv[] )
 		if (verbose) { fprintf(stdout, "\n"); }
 #ifdef USE_SUBMIT_UTILS
 		submit_hash.warn_unused(stderr);
+		// if there was an errorstack, then the above populates the errorstack rather than printing to stdout
+		// so we now flush the errstack to stdout.
+		print_errstack(stderr, submit_hash.error_stack());
 #else
 
 		// Force non-zero ref count for DAG_STATUS and FAILED_COUNT
@@ -6908,7 +6957,7 @@ SetGSICredentials()
 // so as not to churn the old code.  -zmiller
 
 		bool submit_sends_x509 = true;
-		CondorVersionInfo cvi(MySchedd->version());
+		CondorVersionInfo cvi(MySchedd ? MySchedd->version() : NULL);
 		if (cvi.built_since_version(8, 5, 8)) {
 			submit_sends_x509 = false;
 		}
@@ -7067,16 +7116,6 @@ SetSendCredential()
 	InsertJobExpr(buffer);
 }
 
-void
-SetSendCredentialInAd( ClassAd *job_ad )
-{
-	if (!sent_credential_to_credd) {
-		return;
-	}
-
-	// add it to the job ad (starter needs to know this value)
-	job_ad->Assign( ATTR_JOB_SEND_CREDENTIAL, true );
-}
 
 #if !defined(WIN32)
 // this allocates memory, free() it when you're done.
@@ -7994,7 +8033,6 @@ int SpecialSubmitParse(void* pv, MACRO_SOURCE& source, MACRO_SET& macro_set, cha
 	return -1;
 }
 
-
 int read_submit_file(FILE * fp)
 {
 	ErrContext.phase = PHASE_READ_SUBMIT;
@@ -8056,10 +8094,20 @@ int read_submit_file(FILE * fp)
 
 	if( rval < 0 ) {
 		fprintf (stderr, "\nERROR: on Line %d of submit file: %s\n", FileMacroSource.line, errmsg.c_str());
+#ifdef USE_SUBMIT_UTILS
+		if (submit_hash.error_stack()) {
+			std::string errstk(submit_hash.error_stack()->getFullText());
+			if ( ! errstk.empty()) {
+				fprintf(stderr, "%s", errstk.c_str());
+			}
+			submit_hash.error_stack()->clear();
+		}
+#else
 		if (SubmitMacroSet.errors) {
 			fprintf(stderr, "%s", SubmitMacroSet.errors->getFullText().c_str());
 			SubmitMacroSet.errors->clear();
 		}
+#endif
 	} else {
 		ErrContext.phase = PHASE_QUEUE_ARG;
 
@@ -8543,6 +8591,7 @@ int queue_item(int num, StringList & vars, char * item, int item_index, int opti
 			dash_interactive, dash_remote,
 			check_sub_file, NULL);
 		if ( ! job) {
+			print_errstack(stderr, submit_hash.error_stack());
 			DoCleanup(0,0,NULL);
 			exit(1);
 		}
@@ -9724,6 +9773,16 @@ int SendJobCredential()
 	return 0;
 }
 
+void SetSendCredentialInAd( ClassAd *job_ad )
+{
+	if (!sent_credential_to_credd) {
+		return;
+	}
+
+	// add it to the job ad (starter needs to know this value)
+	job_ad->Assign( ATTR_JOB_SEND_CREDENTIAL, true );
+}
+
 #ifdef USE_SUBMIT_UTILS
 
 int SendLastExecutable()
@@ -10873,7 +10932,7 @@ SetVMParams()
 #endif
 
 #ifdef USE_SUBMIT_UTILS
-PRAGMA_REMIND("make a proper queue args unit test.")
+//PRAGMA_REMIND("make a proper queue args unit test.")
 int DoUnitTests(int options)
 {
 	return (options > 1) ? 1 : 0;

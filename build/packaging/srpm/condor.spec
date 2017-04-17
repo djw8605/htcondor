@@ -1262,6 +1262,7 @@ rm -rf %{buildroot}
 %_libexecdir/condor/panda-plugin.so
 %_libexecdir/condor/pandad
 %_mandir/man1/condor_advertise.1.gz
+%_mandir/man1/condor_annex.1.gz
 %_mandir/man1/condor_check_userlogs.1.gz
 %_mandir/man1/condor_chirp.1.gz
 %_mandir/man1/condor_cod.1.gz
@@ -1897,6 +1898,19 @@ fi
 %endif
 
 %changelog
+* Thu Mar 02 2017 Tim Theisen <tim@cs.wisc.edu> - 8.7.0-1
+- Performance improvements in collector's ingestion of ClassAds
+- Added collector attributes to report query times and forks
+- Removed extra white space around parentheses when unparsing ClassAds
+- Technology preview of the HTCondor Annex
+
+* Thu Mar 02 2017 Tim Theisen <tim@cs.wisc.edu> - 8.6.1-1
+- condor_q works in situations where user authentication is not configured
+- Updates to work with Docker version 1.13
+- Fix several problems with the Job Router
+- Update scripts to support current versions of Open MPI and MPICH2
+- Fixed a bug that could corrupt the job queue log when the disk is full
+
 * Thu Jan 26 2017 Tim Theisen <tim@cs.wisc.edu> - 8.6.0-1
 - condor_q shows shows only the current user's jobs by default
 - condor_q summarizes related jobs (batches) on a single line by default

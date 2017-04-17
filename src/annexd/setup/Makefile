@@ -2,9 +2,9 @@
 # Upload the functions and templates to the appropriate place(s) on S3.
 #
 
-VERSION = 6
-FUNCTIONS = sfr-lease-$(VERSION).zip odi-lease-$(VERSION).zip
-TEMPLATES = template-$(VERSION).json role-$(VERSION).json
+VERSION = 7
+FUNCTIONS = sfr-lease-$(VERSION).zip odi-lease-$(VERSION).zip check-connectivity-$(VERSION).zip
+TEMPLATES = template-$(VERSION).json role-$(VERSION).json bucket-$(VERSION).json security-group-$(VERSION).json
 S3TARGETS = $(FUNCTIONS:%=.upload/%) $(TEMPLATES:%=.upload/%)
 
 all : s3upload
@@ -36,6 +36,10 @@ odi-lease-$(VERSION).zip : odi-lease.js
 	@rm -f $@
 	@zip $@ $^
 
+check-connectivity-$(VERSION).zip : check-connectivity.py
+	@rm -f $@
+	@zip $@ $^
+
 #
 # Build the template upload from its source.
 #
@@ -45,9 +49,17 @@ template-$(VERSION).json : generate-template
 role-$(VERSION).json : generate-role
 	@./generate-role --pretty-print > $@
 
+bucket-$(VERSION).json : generate-bucket
+	@./generate-bucket --pretty-print > $@
+
+security-group-$(VERSION).json : generate-security-group
+	@./generate-security-group --pretty-print > $@
+
 #
 # Run the template generator (for distribution).
 #
-templates : template role
+templates : template role bucket
 template : template-$(VERSION).json
 role : role-$(VERSION).json
+bucket : bucket-$(VERSION).json
+security-group : security-group-$(VERSION).json

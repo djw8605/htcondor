@@ -5419,6 +5419,12 @@ WANT_HOLD_REASON = \
   must either be a string or an expression that evaluates to a
   string.
 
+  For Docker Universe jobs, any directories that are mounted under scratch are
+  also volume mounted on the same paths inside the container.  That is, any
+  reads or writes to files in those directories goes to the host filesytem
+  under the scratch directory.  This is useful if a container has limited space
+  to grow a filesytem.
+
 \end{description}
 
 The following macros control if the \Condor{startd} daemon should perform
@@ -7118,8 +7124,8 @@ MAX_JOBS_RUNNING	= \
 \label{param:SystemPeriodicHold}
 \item[\Macro{SYSTEM\_PERIODIC\_HOLD}]
   This expression behaves identically
-  to the job expression \AdAttr{periodic\_hold}, but it is evaluated by
-  the \Condor{schedd} daemon individually for each job in the queue.
+  to the job expression \AdAttr{periodic\_hold}, but it is evaluated
+  for every job in the queue.
   It defaults to \Expr{False}.
   When \Expr{True}, it causes the job to stop running and go on hold.
   Here is an
@@ -7158,8 +7164,8 @@ SYSTEM_PERIODIC_HOLD = \
   This expression behaves identically
   to a job's definition of a \SubmitCmd{periodic\_release} expression
   in a submit description file,
-  but it is evaluated by
-  the \Condor{schedd} daemon individually for each job in the queue.
+  but it is evaluated
+  for every job in the queue.
   It defaults to \Expr{False}.
   When \Expr{True}, it causes a Held job to return to the Idle state.
   Here is an example
@@ -9107,7 +9113,7 @@ These macros affect the \Condor{negotiator}.
   Caching open sockets makes the negotiation
   protocol more efficient by eliminating the need for socket
   connection establishment for each negotiation cycle.  The default is
-  currently 16.  To be effective, this parameter should be set to a
+  currently 500.  To be effective, this parameter should be set to a
   value greater than the number of \Condor{schedd}s submitting jobs to the
   negotiator at any time.  If you lower this number, you must run
   \Condor{restart} and not just \Condor{reconfig} for the change to
@@ -10768,6 +10774,16 @@ not changed by doing a \Condor{reconfig}.
   The variable was previously used to change the reading of DAG input
   files to that of HTCondor versions prior to 8.0.6. 
   \Bold{Note: users should never change this setting.}
+
+\label{param:DAGmanUseSharedPort}
+\item[\Macro{DAGMAN\_USE\_SHARED\_PORT}]
+  A boolean value that controls whether \Condor{dagman} will attempt to
+  connect to the shared port daemon.
+  If not defined, \MacroNI{DAGMAN\_USE\_SHARED\_PORT} defaults to
+  \Expr{False}.  There is no reason to ever change this value; it
+  was introduced to prevent spurious shared port-related error messages
+  from appearing in \File{dagman.out} files.
+  (Introduced in version 8.6.1.)
 
 \end{description}
 
@@ -14068,3 +14084,11 @@ in ClassAds that the \Condor{collector} daemon has.
   is used when not specified.
 
 \end{description}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{\label{sec:Config-annex}\Condor{annex} Configuration File Macros}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\index{configuration!condor\_annex configuration variables}
+
+See section \ref{sec:clouds-config} for \Condor{annex} configuration file
+macros.

@@ -24,6 +24,16 @@
 #include "OnDemandRequest.h"
 #include "UploadFile.h"
 
+#include "CreateStack.h"
+#include "WaitForStack.h"
+#include "CheckForStack.h"
+#include "SetupReply.h"
+#include "GenerateConfigFile.h"
+#include "CreateKeyPair.h"
+#include "CheckConnectivity.h"
+
+#include "user-config-dir.h"
+
 // from annex.cpp
 #include "condor_common.h"
 #include "condor_config.h"
@@ -33,6 +43,11 @@
 #include "dc_annexd.h"
 #include "stat_wrapper.h"
 #include "condor_base64.h"
+
+#include "my_username.h"
+#include <iostream>
+
+#include "daemon.h"
 
 // Although the annex daemon uses a GAHP, it doesn't have a schedd managing
 // its hard state in an existing job ad; it has to do that job on its own.
@@ -140,6 +155,101 @@ validateLease( time_t endOfLease, std::string & validationError ) {
 }
 
 int
+updateOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
+	std::string publicKeyFile, secretKeyFile, eventsURL;
+
+	param( publicKeyFile, "ANNEX_DEFAULT_ACCESS_KEY_FILE" );
+	command->LookupString( "PublicKeyFile", publicKeyFile );
+
+	param( secretKeyFile, "ANNEX_DEFAULT_SECRET_KEY_FILE" );
+	command->LookupString( "SecretKeyFile", secretKeyFile );
+
+	param( eventsURL, "ANNEX_DEFAULT_CWE_URL" );
+	command->LookupString( "EventsURL", eventsURL );
+
+	std::string annexID, leaseFunctionARN;
+
+	command->LookupString( "AnnexID", annexID );
+	command->LookupString( "LeaseFunctionARN", leaseFunctionARN );
+
+	time_t endOfLease = 0;
+	command->LookupInteger( "EndOfLease", endOfLease );
+
+	std::string errorString;
+	if( publicKeyFile.empty() ) {
+		formatstr( errorString, "%s%sPublic key file not specified in command or by defaults.", errorString.c_str(), errorString.empty() ? "" : "  " );
+	}
+	if( secretKeyFile.empty() ) {
+		formatstr( errorString, "%s%sSecret key file not specified in command or defaults.", errorString.c_str(), errorString.empty() ? "" : "  " );
+	}
+	if( eventsURL.empty() ) {
+		formatstr( errorString, "%s%sEvents URL missing or empty in command ad and ANNEX_DEFAULT_CWE_URL not set or empty in configuration.", errorString.c_str(), errorString.empty() ? "" : "  " );
+	}
+	if( annexID.empty() ) {
+		formatstr( errorString, "%s%sAnnex ID missing or empty in command ad.", errorString.c_str(), errorString.empty() ? "" : "  " );
+	}
+	if( leaseFunctionARN.empty() ) {
+		formatstr( errorString, "%s%sLease function ARN missing or empty in command ad.", errorString.c_str(), errorString.empty() ? "" : "  " );
+	}
+	validateLease( endOfLease, errorString );
+
+	if(! errorString.empty()) {
+		reply->Assign( ATTR_RESULT, getCAResultString( CA_INVALID_REQUEST ) );
+		reply->Assign( ATTR_ERROR_STRING, errorString );
+
+		if( replyStream ) {
+			if(! sendCAReply( replyStream, "CA_BULK_REQUEST", reply )) {
+				dprintf( D_ALWAYS, "Failed to reply to CA_BULK_REQUEST.\n" );
+			}
+		}
+
+		return FALSE;
+	}
+
+	ClassAd * scratchpad = new ClassAd();
+	EC2GahpClient * eventsGahp = startOneGahpClient( publicKeyFile, eventsURL );
+
+	std::string commandID;
+	command->LookupString( "CommandID", commandID );
+	if( commandID.empty() ) {
+		generateCommandID( commandID );
+		command->Assign( "CommandID", commandID );
+	}
+	scratchpad->Assign( "CommandID", commandID );
+
+	// FIXME: For user-friendliness, if no other reason, we should check
+	// if the annex exists before we "update" its lease.  Unfortunately,
+	// that's an ODI/SFR -specific operation.  We could check to see if
+	// the corresponding rule and target exist, instead, and refuse to
+	// do anything if they don't.
+
+	PutRule * pr = new PutRule(
+		reply, eventsGahp, scratchpad,
+		eventsURL, publicKeyFile, secretKeyFile,
+		commandState, commandID, annexID );
+	PutTargets * pt = new PutTargets( leaseFunctionARN, endOfLease,
+		reply, eventsGahp, scratchpad,
+		eventsURL, publicKeyFile, secretKeyFile,
+		commandState, commandID, annexID );
+
+	// I should feel bad.
+	scratchpad->Assign( "BulkRequestID", "Lease updated." );
+	ReplyAndClean * last = new ReplyAndClean( reply, replyStream,
+		NULL, scratchpad, eventsGahp, commandState, commandID, NULL );
+
+	FunctorSequence * fs = new FunctorSequence( { pr, pt }, last,
+		commandState, commandID, scratchpad );
+
+	int functorSequenceTimer = daemonCore->Register_Timer( 0, TIMER_NEVER,
+		(void (Service::*)()) & FunctorSequence::operator(),
+		"updateOneAnnex() sequence", fs );
+   	eventsGahp->setNotificationTimerId( functorSequenceTimer );
+
+	return KEEP_STREAM;
+}
+
+
+int
 createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 	// dPrintAd( D_FULLDEBUG, * command );
 
@@ -177,35 +287,25 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 	std::string serviceURL, eventsURL, lambdaURL, s3URL;
 
 	param( serviceURL, "ANNEX_DEFAULT_EC2_URL" );
-	// FIXME: look up service URL from authorized user map.
 	command->LookupString( "ServiceURL", serviceURL );
 
 	param( eventsURL, "ANNEX_DEFAULT_CWE_URL" );
-	// FIXME: look up events URL from authorized user map.
 	command->LookupString( "EventsURL", eventsURL );
 
 	param( lambdaURL, "ANNEX_DEFAULT_LAMBDA_URL" );
-	// FIXME: look up lambda URL from authorized user map.
 	command->LookupString( "LambdaURL", lambdaURL );
 
 	param( s3URL, "ANNEX_DEFAULT_S3_URL" );
-	// FIXME: look up lambda URL from authorized user map.
 	command->LookupString( "S3URL", s3URL );
 
 	std::string publicKeyFile, secretKeyFile, leaseFunctionARN;
 
-	// FIXME: look up public key file from authorized user map.
 	param( publicKeyFile, "ANNEX_DEFAULT_ACCESS_KEY_FILE" );
 	command->LookupString( "PublicKeyFile", publicKeyFile );
 
-	// FIXME: look up secret key file from authorized user map.
 	param( secretKeyFile, "ANNEX_DEFAULT_SECRET_KEY_FILE" );
 	command->LookupString( "SecretKeyFile", secretKeyFile );
 
-	// FIXME: look up lease function ARN from authorized user map
-	// (from the endpoint-specific sub-map).  There will actually
-	// be two listings, one for SFR and one for ODI, so we need to
-	// know which type of annex we'll be making before doing this look-up.
 	command->LookupString( "LeaseFunctionARN", leaseFunctionARN );
 
 	// Validate parameters.  We could have the functors do this, but that
@@ -293,14 +393,6 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 	}
 	scratchpad->Assign( "CommandID", commandID );
 
-	// The annex ID will form part of the SFR (or ODI) client token, which
-	// allows the corresponding lease function to cnacel them all without
-	// having to continually add or update the target(s) in the lease.  Since
-	// we don't need to know the SFR (or instance) ID -- or even its entire
-	// client token -- we can create the lease /before/ we start instances.
-	//
-	// If the user specified an annex name, we'll use the first 36 characters,
-	// the same length as the UUID we'd otherwise generate.
 	std::string annexID;
 	command->LookupString( "AnnexID", annexID );
 	if( annexID.empty() ) {
@@ -309,7 +401,7 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 		if( annexName.empty() ) {
 			generateAnnexID( annexID );
 		} else {
-			annexID = annexName.substr( 0, 36 );
+			annexID = annexName.substr( 0, 27 );
 		}
 		command->Assign( "AnnexID", annexID );
 	}
@@ -379,6 +471,30 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 			reply, lambdaGahp, scratchpad,
 	    	lambdaURL, publicKeyFile, secretKeyFile,
 			commandState, commandID );
+
+		UploadFile * uf = NULL;
+		std::string uploadFrom;
+		command->LookupString( "UploadFrom", uploadFrom );
+		std::string uploadTo;
+		command->LookupString( "UploadTo", uploadTo );
+		if( (! uploadFrom.empty()) && (! uploadTo.empty()) ) {
+			uf = new UploadFile( uploadFrom, uploadTo,
+				reply, s3Gahp, scratchpad,
+				s3URL, publicKeyFile, secretKeyFile,
+				commandState, commandID, annexID );
+		}
+
+		// Verify that we're talking to the right collector before we do
+		// anything else.
+		std::string instanceID, connectivityFunctionARN;
+		command->LookupString( "CollectorInstanceID", instanceID );
+		param( connectivityFunctionARN, "ANNEX_DEFAULT_CONNECTIVITY_FUNCTION_ARN" );
+		CheckConnectivity * cc = new CheckConnectivity(
+			connectivityFunctionARN, instanceID,
+			reply, lambdaGahp, scratchpad,
+			lambdaURL, publicKeyFile, secretKeyFile,
+			commandState, commandID );
+
 		PutRule * pr = new PutRule(
 			reply, eventsGahp, scratchpad,
 			eventsURL, publicKeyFile, secretKeyFile,
@@ -399,7 +515,7 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 		//
 		// The commandState, commandID, and scratchpad allow the functor sequence
 		// to restart a rollback, if that becomes necessary.
-		FunctorSequence * fs = new FunctorSequence( { gf, pr, pt, br }, last, commandState, commandID, scratchpad );
+		FunctorSequence * fs = new FunctorSequence( { cc, gf, uf, pr, pt, br }, last, commandState, commandID, scratchpad );
 
 		// Create a timer for the gahp to fire when it gets a result.  We must
 		// use TIMER_NEVER to ensure that the timer hasn't been reaped when the
@@ -410,9 +526,21 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 		gahp->setNotificationTimerId( functorSequenceTimer );
     	eventsGahp->setNotificationTimerId( functorSequenceTimer );
     	lambdaGahp->setNotificationTimerId( functorSequenceTimer );
+    	s3Gahp->setNotificationTimerId( functorSequenceTimer );
 
 		return KEEP_STREAM;
 	} else if( annexType == "odi" ) {
+		// Verify that we're talking to the right collector before we do
+		// anything else.
+		std::string instanceID, connectivityFunctionARN;
+		command->LookupString( "CollectorInstanceID", instanceID );
+		param( connectivityFunctionARN, "ANNEX_DEFAULT_CONNECTIVITY_FUNCTION_ARN" );
+		CheckConnectivity * cc = new CheckConnectivity(
+			connectivityFunctionARN, instanceID,
+			reply, lambdaGahp, scratchpad,
+			lambdaURL, publicKeyFile, secretKeyFile,
+			commandState, commandID );
+
 		OnDemandRequest * odr = new OnDemandRequest( reply, gahp, scratchpad,
 			serviceURL, publicKeyFile, secretKeyFile, commandState,
 			commandID, annexID );
@@ -461,9 +589,9 @@ createOneAnnex( ClassAd * command, Stream * replyStream, ClassAd * reply ) {
 
 		FunctorSequence * fs;
 		if( uf ) {
-			fs = new FunctorSequence( { gf, uf, pr, pt, odr }, last, commandState, commandID, scratchpad );
+			fs = new FunctorSequence( { cc, gf, uf, pr, pt, odr }, last, commandState, commandID, scratchpad );
 		} else {
-			fs = new FunctorSequence( { gf, pr, pt, odr }, last, commandState, commandID, scratchpad );
+			fs = new FunctorSequence( { cc, gf, pr, pt, odr }, last, commandState, commandID, scratchpad );
 		}
 
 		int functorSequenceTimer = daemonCore->Register_Timer( 0, TIMER_NEVER,
@@ -510,25 +638,27 @@ main_config() {
 bool
 createConfigTarball(	const char * configDir,
 						const char * annexName,
+						const char * owner,
 						long unclaimedTimeout,
 						std::string & tarballPath,
-						std::string & tarballError ) {
+						std::string & tarballError,
+						std::string & instanceID ) {
 	char * cwd = get_current_dir_name();
 
 	int rv = chdir( configDir );
 	if( rv != 0 ) {
-		formatstr( tarballError, "Unable to change to config dir '%s' (%d): '%s'.\n",
+		formatstr( tarballError, "unable to change to config dir '%s' (%d): '%s'",
 			configDir, errno, strerror( errno ) );
 		return false;
 	}
 
 	// Must be readable by the 'condor' user on the instance, but it
 	// will be owned by root.
-	int fd = safe_open_wrapper_follow( "99ec2-dynamic.config",
+	int fd = safe_open_wrapper_follow( "00ec2-dynamic.config",
 		O_WRONLY | O_CREAT | O_TRUNC, 0644 );
 	if( fd < 0 ) {
-		formatstr( tarballError, "Failed to open config file '%s' for writing: '%s' (%d).\n",
-			"99ec2-dynamic.config", strerror( errno ), errno );
+		formatstr( tarballError, "failed to open config file '%s' for writing: '%s' (%d)",
+			"00ec2-dynamic.config", strerror( errno ), errno );
 		return false;
 	}
 
@@ -538,8 +668,26 @@ createConfigTarball(	const char * configDir,
 	std::string collectorHost;
 	param( collectorHost, "COLLECTOR_HOST" );
 	if( collectorHost.empty() ) {
-		formatstr( tarballError, "COLLECTOR_HOST empty or undefined, aborting.\n" );
+		formatstr( tarballError, "COLLECTOR_HOST empty or undefined" );
 		return false;
+	}
+
+	Daemon collector( DT_COLLECTOR, collectorHost.c_str() );
+	if(! collector.locate()) {
+		formatstr( tarballError, "unable to find collector defined by COLLECTOR_HOST (%s)", collectorHost.c_str() );
+		return false;
+	}
+	if(! collector.getInstanceID( instanceID )) {
+		formatstr( tarballError, "unable to get collector's instance ID" );
+		return false;
+	}
+
+	std::string startExpression = "START = MayUseAWS == TRUE\n";
+	if( owner != NULL ) {
+		formatstr( startExpression,
+			"START = (MayUseAWS == TRUE) && stringListMember( Owner, \"%s\" )\n"
+			"\n",
+			owner );
 	}
 
 	std::string contents;
@@ -562,17 +710,20 @@ createConfigTarball(	const char * configDir,
 		"MASTER_ATTRS = $(MASTER_ATTRS) AnnexName\n"
 		"\n"
 		"STARTD_NOCLAIM_SHUTDOWN = %ld\n"
-		"\n",
-		collectorHost.c_str(), passwordFile.c_str(), annexName, unclaimedTimeout );
+		"\n"
+		"%s",
+		collectorHost.c_str(), passwordFile.c_str(),
+		annexName, unclaimedTimeout, startExpression.c_str()
+	);
 
 	rv = write( fd, contents.c_str(), contents.size() );
 	if( rv == -1 ) {
-		formatstr( tarballError, "Error writing to '%s': '%s' (%d).\n",
-			"99ec2-dynamic.config", strerror( errno ), errno );
+		formatstr( tarballError, "error writing to '%s': '%s' (%d)",
+			"00ec2-dynamic.config", strerror( errno ), errno );
 		return false;
 	} else if( rv != (int)contents.size() ) {
-		formatstr( tarballError, "Short write to '%s': '%s' (%d).\n",
-			"99ec2-dynamic.config", strerror( errno ), errno );
+		formatstr( tarballError, "short write to '%s': '%s' (%d)",
+			"00ec2-dynamic.config", strerror( errno ), errno );
 		return false;
 	}
 	close( fd );
@@ -581,7 +732,7 @@ createConfigTarball(	const char * configDir,
 	std::string localPasswordFile;
 	param( localPasswordFile, "SEC_PASSWORD_FILE" );
 	if( passwordFile.empty() ) {
-		formatstr( tarballError, "SEC_PASSWORD_FILE empty or undefined, aborting.\n" );
+		formatstr( tarballError, "SEC_PASSWORD_FILE empty or undefined" );
 		return false;
 	}
 
@@ -590,7 +741,7 @@ createConfigTarball(	const char * configDir,
 	formatstr( cpCommand, "cp '%s' '%s'", localPasswordFile.c_str(), passwordFile.c_str() );
 	int status = system( cpCommand.c_str() );
 	if(! (WIFEXITED( status ) && (WEXITSTATUS( status ) == 0))) {
-		formatstr( tarballError, "Failed to copy '%s' to '%s', aborting.\n",
+		formatstr( tarballError, "failed to copy '%s' to '%s'",
 			localPasswordFile.c_str(), passwordFile.c_str() );
 		return false;
 	}
@@ -604,7 +755,7 @@ createConfigTarball(	const char * configDir,
 	// on platforms whose version of mkstemp() is broken.
 	int tfd = mkstemp( tarballName );
 	if( tfd == -1 ) {
-		formatstr( tarballError, "Failed to create temporary filename for tarball, aborting.\n" );
+		formatstr( tarballError, "failed to create temporary filename for tarball" );
 		return false;
 	}
 
@@ -613,7 +764,7 @@ createConfigTarball(	const char * configDir,
 	formatstr( command, "tar -z -c -f '%s' *", tarballName );
 	status = system( command.c_str() );
 	if(! (WIFEXITED( status ) && (WEXITSTATUS( status ) == 0))) {
-		formatstr( tarballError, "Failed to create tarball, aborting.\n" );
+		formatstr( tarballError, "failed to create tarball" );
 		return false;
 	}
 	tarballPath = tarballName;
@@ -621,7 +772,7 @@ createConfigTarball(	const char * configDir,
 
 	rv = chdir( cwd );
 	if( rv != 0 ) {
-		formatstr( tarballError, "Unable to change back to working dir '%s' (%d): '%s'.\n",
+		formatstr( tarballError, "unable to change back to working dir '%s' (%d): '%s'",
 			cwd, errno, strerror( errno ) );
 		return false;
 	}
@@ -640,6 +791,26 @@ callCreateOneAnnex() {
 
 	// Otherwise, reply-and-clean will take care of user notification.
 	if( createOneAnnex( command, s, reply ) != KEEP_STREAM ) {
+		std::string resultString;
+		reply->LookupString( ATTR_RESULT, resultString );
+		CAResult result = getCAResultNum( resultString.c_str() );
+		ASSERT( result != CA_SUCCESS );
+
+		std::string errorString;
+		reply->LookupString( ATTR_ERROR_STRING, errorString );
+		ASSERT(! errorString.empty());
+		fprintf( stderr, "%s\n", errorString.c_str() );
+		DC_Exit( 6 );
+	}
+}
+
+void
+callUpdateOneAnnex() {
+	Stream * s = NULL;
+	ClassAd * reply = new ClassAd();
+
+	// Otherwise, reply-and-clean will take care of user notification.
+	if( updateOneAnnex( command, s, reply ) != KEEP_STREAM ) {
 		std::string resultString;
 		reply->LookupString( ATTR_RESULT, resultString );
 		CAResult result = getCAResultNum( resultString.c_str() );
@@ -718,41 +889,333 @@ readShortFile( const char * fileName, std::string & contents ) {
     return true;
 }
 
+void checkOneParameter( const char * pName, int & rv, std::string & pValue ) {
+	param( pValue, pName );
+	if( pValue.empty() ) {
+		if( rv == 0 ) { fprintf( stderr, "Your setup is incomplete:\n" ); }
+		fprintf( stderr, "\t%s is unset.\n", pName );
+		rv = 1;
+	}
+}
+
+void
+checkOneParameter( const char * pName, int & rv ) {
+	std::string pValue;
+	checkOneParameter( pName, rv, pValue );
+}
+
+int
+check_account_setup( const std::string & publicKeyFile, const std::string & privateKeyFile, const std::string & cfURL, const std::string & ec2URL ) {
+	ClassAd * reply = new ClassAd();
+	ClassAd * scratchpad = new ClassAd();
+
+	std::string commandID;
+	generateCommandID( commandID );
+
+	Stream * replyStream = NULL;
+
+	EC2GahpClient * cfGahp = startOneGahpClient( publicKeyFile, cfURL );
+	EC2GahpClient * ec2Gahp = startOneGahpClient( publicKeyFile, ec2URL );
+
+	std::string bucketStackName = "HTCondorAnnex-ConfigurationBucket";
+	std::string bucketStackDescription = "configuration bucket";
+	CheckForStack * bucketCFS = new CheckForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		bucketStackName, bucketStackDescription,
+		commandState, commandID );
+
+	std::string lfStackName = "HTCondorAnnex-LambdaFunctions";
+	std::string lfStackDescription = "Lambda functions";
+	CheckForStack * lfCFS = new CheckForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		lfStackName, lfStackDescription,
+		commandState, commandID );
+
+	std::string rStackName = "HTCondorAnnex-InstanceProfile";
+	std::string rStackDescription = "instance profile";
+	CheckForStack * rCFS = new CheckForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		rStackName, rStackDescription,
+		commandState, commandID );
+
+	std::string sgStackName = "HTCondorAnnex-SecurityGroup";
+	std::string sgStackDescription = "security group";
+	CheckForStack * sgCFS = new CheckForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		sgStackName, sgStackDescription,
+		commandState, commandID );
+
+	SetupReply * sr = new SetupReply( reply, cfGahp, ec2Gahp, "Your setup looks OK.\n", scratchpad,
+		replyStream, commandState, commandID );
+
+	FunctorSequence * fs = new FunctorSequence(
+		{ bucketCFS, lfCFS, rCFS, sgCFS }, sr,
+		commandState, commandID, scratchpad );
+
+	int setupTimer = daemonCore->Register_Timer( 0, TIMER_NEVER,
+		 (void (Service::*)()) & FunctorSequence::operator(),
+		 "CheckForStacks", fs );
+	cfGahp->setNotificationTimerId( setupTimer );
+	ec2Gahp->setNotificationTimerId( setupTimer );
+
+	return 0;
+}
+
+int
+check_setup() {
+	int rv = 0;
+
+	std::string accessKeyFile, secretKeyFile, cfURL, ec2URL;
+	checkOneParameter( "ANNEX_DEFAULT_ACCESS_KEY_FILE", rv, accessKeyFile );
+	checkOneParameter( "ANNEX_DEFAULT_SECRET_KEY_FILE", rv, secretKeyFile );
+	checkOneParameter( "ANNEX_DEFAULT_CF_URL", rv, cfURL );
+	checkOneParameter( "ANNEX_DEFAULT_EC2_URL", rv, ec2URL );
+
+	checkOneParameter( "ANNEX_DEFAULT_S3_BUCKET", rv );
+	checkOneParameter( "ANNEX_DEFAULT_ODI_SECURITY_GROUP_IDS", rv );
+	checkOneParameter( "ANNEX_DEFAULT_ODI_LEASE_FUNCTION_ARN", rv );
+	checkOneParameter( "ANNEX_DEFAULT_SFR_LEASE_FUNCTION_ARN", rv );
+	checkOneParameter( "ANNEX_DEFAULT_ODI_INSTANCE_PROFILE_ARN", rv );
+
+	if( rv != 0 ) {
+		return rv;
+	} else {
+		return check_account_setup( accessKeyFile, secretKeyFile, cfURL, ec2URL );
+	}
+}
+
+void
+setup_usage() {
+	fprintf( stdout,
+		"\n"
+		"To do the one-time setup for an AWS account:\n"
+		"\tcondor_annex -setup\n"
+		"\n"
+		"To specify the files for the access (public) key and secret (private) keys:\n"
+		"\tcondor_annex -setup\n"
+		"\t\t<path/to/access-key-file>\n"
+		"\t\t<path/to/private-key-file>\n"
+		"\n"
+		"Expert mode (to specify the region, you must specify the key paths):\n"
+		"\tcondor_annex -aws-ec2-url https://ec2.<region>.amazonaws.com\n"
+		"\t\t-setup <path/to/access-key-file>\n"
+		"\t\t<path/to/private-key-file>\n"
+		"\t\t<https://cloudformation.<region>.amazonaws.com/>\n"
+		"\n"
+	);
+}
+
+int
+setup( const char * pukf, const char * prkf, const char * cloudFormationURL, const char * serviceURL ) {
+	std::string publicKeyFile, privateKeyFile;
+	if( pukf != NULL && prkf != NULL ) {
+		publicKeyFile = pukf;
+		privateKeyFile = prkf;
+	} else {
+		std::string userDirectory;
+		if(! createUserConfigDir( userDirectory )) {
+			fprintf( stderr, "You must therefore specify the public and private key files on the command-line.\n" );
+			setup_usage();
+			return 1;
+		} else {
+			publicKeyFile = userDirectory + "/publicKeyFile";
+			privateKeyFile = userDirectory + "/privateKeyFile";
+		}
+	}
+
+	int fd = safe_open_no_create_follow( publicKeyFile.c_str(), O_RDONLY );
+	if( fd == -1 ) {
+		fprintf( stderr, "Unable to open public key file '%s': '%s' (%d).\n",
+			publicKeyFile.c_str(), strerror( errno ), errno );
+		setup_usage();
+		return 1;
+	}
+	close( fd );
+
+	fd = safe_open_no_create_follow( privateKeyFile.c_str(), O_RDONLY );
+	if( fd == -1 ) {
+		fprintf( stderr, "Unable to open private key file '%s': '%s' (%d).\n",
+			privateKeyFile.c_str(), strerror( errno ), errno );
+		setup_usage();
+		return 1;
+	}
+	close( fd );
+
+
+	std::string cfURL = cloudFormationURL ? cloudFormationURL : "";
+	if( cfURL.empty() ) {
+		// FIXME: At some point, the argument to 'setup' should be the region,
+		// not the CloudFormation URL.
+		param( cfURL, "ANNEX_DEFAULT_CF_URL" );
+	}
+	if( cfURL.empty() ) {
+		fprintf( stderr, "No CloudFormation URL specified on command-line and ANNEX_DEFAULT_CF_URL is not set or empty in configuration.\n" );
+		return 1;
+	}
+
+	std::string ec2URL = serviceURL ? serviceURL : "";
+	if( ec2URL.empty() ) {
+		param( ec2URL, "ANNEX_DEFAULT_EC2_URL" );
+	}
+	if( ec2URL.empty() ) {
+		fprintf( stderr, "No EC2 URL specified on command-line and ANNEX_DEFAULT_EC2_URL is not set or empty in configuration.\n" );
+		return 1;
+	}
+
+	ClassAd * reply = new ClassAd();
+	ClassAd * scratchpad = new ClassAd();
+
+	// This 100% redundant, but it moves all our config-file generation
+	// code to the same place, so it's worth it.
+	scratchpad->Assign( "AccessKeyFile", publicKeyFile );
+	scratchpad->Assign( "SecretKeyFile", privateKeyFile );
+
+	std::string commandID;
+	generateCommandID( commandID );
+
+	Stream * replyStream = NULL;
+
+	EC2GahpClient * cfGahp = startOneGahpClient( publicKeyFile, cfURL );
+	EC2GahpClient * ec2Gahp = startOneGahpClient( publicKeyFile, ec2URL );
+
+	// FIXME: Do something cleverer for versioning.
+	std::string bucketStackURL = "https://s3.amazonaws.com/condor-annex/bucket-7.json";
+	std::string bucketStackName = "HTCondorAnnex-ConfigurationBucket";
+	std::string bucketStackDescription = "configuration bucket (this takes less than a minute)";
+	std::map< std::string, std::string > bucketParameters;
+	CreateStack * bucketCS = new CreateStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		bucketStackName, bucketStackURL, bucketParameters,
+		commandState, commandID );
+	WaitForStack * bucketWFS = new WaitForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		bucketStackName, bucketStackDescription,
+		commandState, commandID );
+
+	// FIXME: Do something cleverer for versioning.
+	std::string lfStackURL = "https://s3.amazonaws.com/condor-annex/template-7.json";
+	std::string lfStackName = "HTCondorAnnex-LambdaFunctions";
+	std::string lfStackDescription = "Lambda functions (this takes about a minute)";
+	std::map< std::string, std::string > lfParameters;
+	lfParameters[ "S3BucketName" ] = "<scratchpad>";
+	CreateStack * lfCS = new CreateStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		lfStackName, lfStackURL, lfParameters,
+		commandState, commandID );
+	WaitForStack * lfWFS = new WaitForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		lfStackName, lfStackDescription,
+		commandState, commandID );
+
+	// FIXME: Do something cleverer for versioning.
+	std::string rStackURL = "https://s3.amazonaws.com/condor-annex/role-7.json";
+	std::string rStackName = "HTCondorAnnex-InstanceProfile";
+	std::string rStackDescription = "instance profile (this takes about two minutes)";
+	std::map< std::string, std::string > rParameters;
+	rParameters[ "S3BucketName" ] = "<scratchpad>";
+	CreateStack * rCS = new CreateStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		rStackName, rStackURL, rParameters,
+		commandState, commandID );
+	WaitForStack * rWFS = new WaitForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		rStackName, rStackDescription,
+		commandState, commandID );
+
+	// FIXME: Do something cleverer for versioning.
+	std::string sgStackURL = "https://s3.amazonaws.com/condor-annex/security-group-7.json";
+	std::string sgStackName = "HTCondorAnnex-SecurityGroup";
+	std::string sgStackDescription = "security group (this takes less than a minute)";
+	std::map< std::string, std::string > sgParameters;
+	CreateStack * sgCS = new CreateStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		sgStackName, sgStackURL, sgParameters,
+		commandState, commandID );
+	WaitForStack * sgWFS = new WaitForStack( reply, cfGahp, scratchpad,
+		cfURL, publicKeyFile, privateKeyFile,
+		sgStackName, sgStackDescription,
+		commandState, commandID );
+
+	CreateKeyPair * ckp = new CreateKeyPair( reply, ec2Gahp, scratchpad,
+		ec2URL, publicKeyFile, privateKeyFile,
+		commandState, commandID );
+
+	GenerateConfigFile * gcf = new GenerateConfigFile( cfGahp, scratchpad );
+
+	SetupReply * sr = new SetupReply( reply, cfGahp, ec2Gahp, "Setup successful.\n", scratchpad,
+		replyStream, commandState, commandID );
+
+	FunctorSequence * fs = new FunctorSequence(
+		{ bucketCS, bucketWFS, lfCS, lfWFS, rCS, rWFS, sgCS, sgWFS, ckp, gcf }, sr,
+		commandState, commandID, scratchpad );
+
+
+	int setupTimer = daemonCore->Register_Timer( 0, TIMER_NEVER,
+		 (void (Service::*)()) & FunctorSequence::operator(),
+		 "CreateStack, DescribeStacks, WriteConfigFile", fs );
+	cfGahp->setNotificationTimerId( setupTimer );
+	ec2Gahp->setNotificationTimerId( setupTimer );
+
+	return 0;
+}
+
+
 // from annex.cpp
 void
 help( const char * argv0 ) {
-	fprintf( stdout, "usage: %s\n"
-		"\t-annex-name <annex-name>\n"
-		"\t-duration <lease-duration>\n"
-		"\t-slots <desired-capacity> | -count <desired-instances>\n"
-		"\t[-odi | -sfr]\n"
-		"\t[-access-key-file <access-key-file>]\n"
-		"\t[-secret-key-file <secret-key-file>]\n"
-		"\t[-config-dir <path>]\n"
-		"\t[-unclaimed-timeout]\n"
-/*		"\t[-pool <pool>] [-name <name>]\n"
-*/		"\t[-service-url <service-url>]\n"
-		"\t[-events-url <events-url>]\n"
-		"\t[-lambda-url <lambda-url>]\n"
-		"\t[-s3-url <lambda-url>]\n"
-		"\t[-sfr-lease-function-arn <sfr-lease-function-arn>]\n"
-		"\t[-odi-lease-function-arn <odi-lease-function-arn>]\n"
-		"\t[-[default-]user-data[-file] <data|file> ]\n"
-/*		"\t[-debug] [-help]\n"
-*/		"\t[-help]\n"
-		"\t[-sfr-config-file <spot-fleet-configuration-file>]\n"
-		"\t[-odi-instance-type <instance-type>]\n"
-		"\t[-odi-image-id <image-ID>\n"
-		"\t[-odi-security-group-ids <group-ID[,groupID]*>\n"
-		"\t[-odi-key-name <key-name>\n"
-		"\t[-odi-instance-profile-arn <instance-profile-arn>]\n"
-		, argv0 );
-	fprintf( stdout, "%s defaults to On-Demand Instances (-odi).  "
-		"For Spot Fleet Requests, use -sfr.  Specifying "
-		"-sfr-config-file implies -sfr, as does -slots.  "
-		"Specifying -count implies -odi.  You may not specify or imply "
-		"-odi and -sfr in the same command.  Specifying -odi-* implies -odi."
-		"\n", argv0 );
+	fprintf( stdout, "usage: %s -annex-name <annex-name> -count|-slots <number>\n"
+		"For on-demand instances:\n"
+		"\t[-aws-on-demand]\n"
+		"\t-count <integer number of instances>\n"
+		"\n"
+		"For spot fleet instances:\n"
+		"\t[-aws-spot-fleet]\n"
+		"\t-slots <integer number of weighted capacity units>\n"
+		"\n"
+		"To set the lease or idle durations:\n"
+		"\t[-duration <lease duration in decimal hours>]\n"
+		"\t[-idle <idle duration in decimal hours>]\n"
+		"\n"
+		"To customize the annex's HTCondor configuration:\n"
+		"\t[-config-dir </full/path/to/config.d>]\n"
+		"\n"
+		"To set the instances' user data:\n"
+		"\t[-aws-[default-]user-data[-file] <data|path/to/file> ]\n"
+		"\n"
+		"To customize an AWS on-demand annex:\n"
+		"\t[-aws-on-demand-instance-type <instance-type>]\n"
+		"\t[-aws-on-demand-ami-id <AMI-ID>\n"
+		"\t[-aws-on-demand-security-group-ids <group-ID[,groupID]*>\n"
+		"\t[-aws-on-demand-key-name <key-name>]\n"
+		"\n"
+		"To use a customize an AWS Spot Fleet annex, specify a JSON config file:\n"
+		"\t[-aws-spot-fleet-config-file </full/path/to/config.json>]\n"
+		"\n"
+		"To specify who may use your annex:\n"
+		"\t[-owner <username[, username]*>\n"
+		"To specify that anyone may use your annex:\n"
+		"\t[-no-owner]\n"
+		"\n"
+		"To reprint this help:\n"
+		"\t[-help]\n"
+		"\n"
+		"Expert mode (specify account and region):\n"
+		"\t[-aws-access-key-file <path/to/access-key-file>]\n"
+		"\t[-aws-secret-key-file <path/to/secret-key-file>]\n"
+		"\t[-aws-ec2-url https://ec2.<region>.amazonaws.com]\n"
+		"\t[-aws-events-url https://events.<region>.amazonaws.com]\n"
+		"\t[-aws-lambda-url https://lambda.<region>.amazonaws.com]\n"
+		"\t[-aws-s3-url https://s3.<region>.amazonaws.com]\n"
+		"\n"
+		"Expert mode (specify implementation details):\n"
+		"\t[-aws-spot-fleet-lease-function-arn <sfr-lease-function-arn>]\n"
+		"\t[-aws-on-demand-lease-function-arn <odi-lease-function-arn>]\n"
+		"\t[-aws-on-demand-instance-profile-arn <instance-profile-arn>]\n"
+		"\n"
+		"OR, to do the one-time setup for an AWS account:\n"
+		"%s -setup [<path/to/access-key-file> <path/to/secret-key-file> [<CloudFormation URL>]]\n"
+		"\n"
+		, argv0, argv0 );
 }
 
 int _argc;
@@ -781,6 +1244,7 @@ argv = _argv;
 	const char * sfrLeaseFunctionARN = NULL;
 	const char * odiLeaseFunctionARN = NULL;
 	const char * odiInstanceType = NULL;
+	bool odiInstanceTypeSpecified = false;
 	const char * odiImageID = NULL;
 	const char * odiInstanceProfileARN = NULL;
 	const char * odiS3ConfigPath = NULL;
@@ -789,81 +1253,86 @@ argv = _argv;
 	bool annexTypeIsSFR = false;
 	bool annexTypeIsODI = false;
 	long int unclaimedTimeout = 0;
+	bool unclaimedTimeoutSpecified = false;
 	long int leaseDuration = 0;
+	bool leaseDurationSpecified = false;
 	long int count = 0;
+	char * owner = NULL;
+	bool ownerSpecified = false;
+	bool noOwner = false;
 	for( int i = 1; i < argc; ++i ) {
-		if( is_dash_arg_prefix( argv[i], "service-url", 7 ) ) {
+		if( is_dash_arg_prefix( argv[i], "aws-ec2-url", 11 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				serviceURL = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -service-url requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-ec2-url requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "events-url", 6 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-events-url", 14 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				eventsURL = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -events-url requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-events-url requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "lambda-url", 6 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-lambda-url", 14 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				lambdaURL = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -lambda-url requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-lambda-url requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "s3-url", 2 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-s3-url", 10 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				s3URL = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -s3-url requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-s3-url requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "user-data-file", 10 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-user-data-file", 14 ) ) {
 			++i; ++udSpecifications;
 			if( argv[i] != NULL ) {
 				userDataFileName = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -user-data-file requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-user-data-file requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "user-data", 9 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-user-data", 13 ) ) {
 			++i; ++udSpecifications;
 			if( argv[i] != NULL ) {
 				userData = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -user-data requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-user-data requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "default-user-data-file", 18 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-default-user-data-file", 22 ) ) {
 			++i; ++udSpecifications;
 			if( argv[i] != NULL ) {
 				clUserDataWins = false;
 				userDataFileName = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -user-data-file requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-user-data-file requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "default-user-data", 17 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-default-user-data", 21 ) ) {
 			++i; ++udSpecifications;
 			if( argv[i] != NULL ) {
 				clUserDataWins = false;
 				userData = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -user-data requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-user-data requires an argument.\n", argv[0] );
 				return 1;
 			}
 		} else if( is_dash_arg_prefix( argv[i], "annex-name", 6 ) ) {
@@ -884,106 +1353,120 @@ argv = _argv;
 				fprintf( stderr, "%s: -config-dir requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "sfr-config-file", 12 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "owner", 5 ) ) {
+			++i;
+			if( argv[i] != NULL ) {
+				owner = argv[i];
+				ownerSpecified = true;
+				continue;
+			} else {
+				fprintf( stderr, "%s: -owner requires an argument.\n", argv[0] );
+				return 1;
+			}
+		} else if( is_dash_arg_prefix( argv[i], "no-owner", 7 ) ) {
+			++i;
+			noOwner = true;
+		} else if( is_dash_arg_prefix( argv[i], "aws-spot-fleet-config-file", 22 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				sfrConfigFile = argv[i];
 				annexTypeIsSFR = true;
 				continue;
 			} else {
-				fprintf( stderr, "%s: -sfr-config-file requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-spot-fleet-config-file requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "public-key-file", 6 ) ||
-					is_dash_arg_prefix( argv[1], "access-key-file", 6 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-public-key-file", 19 ) ||
+				   is_dash_arg_prefix( argv[i], "aws-access-key-file", 19 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				publicKeyFile = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -{public|access}-key-file requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-access-key-file requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "secret-key-file", 6 ) ||
-					is_dash_arg_prefix( argv[i], "private-key-file", 7 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-secret-key-file", 19 ) ||
+				   is_dash_arg_prefix( argv[i], "aws-private-key-file", 20 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				secretKeyFile = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -{secret|private}-key-file requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-secret-key-file requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "sfr-lease-function-arn", 11 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-spot-fleet-lease-function-arn", 22 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				sfrLeaseFunctionARN = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -sfr-lease-function-arn requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-spot-fleet-lease-function-arn requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-lease-function-arn", 11 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand-lease-function-arn", 21 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiLeaseFunctionARN = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -odi-lease-function-arn requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-on-demand-lease-function-arn requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-instance-type", 14 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand-instance-type", 24 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiInstanceType = argv[i];
+				odiInstanceTypeSpecified = true;
 				continue;
 			} else {
-				fprintf( stderr, "%s: -odi-instance-type requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-on-demand-instance-type requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-key-name", 7 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand-key-name", 17 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiKeyName = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -odi-key-name requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-on-demand-key-name requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-security-group-ids", 21 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand-security-group-ids", 31 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiSecurityGroupIDs = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -odi-security-group-ids requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-on-demand-security-group-ids requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-image-id", 11 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand-ami-id", 20 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiImageID = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -odi-image-id requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-on-demand-ami-id requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-instance-profile-arn", 22 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand-instance-profile-arn", 22 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiInstanceProfileARN = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -lease-function-arn requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-on-demand-instance-profile-arn requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "odi-s3-config-path", 18 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-s3-config-path", 18 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				odiS3ConfigPath = argv[i];
 				continue;
 			} else {
-				fprintf( stderr, "%s: -odi-s3-config-path requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -aws-s3-config-path requires an argument.\n", argv[0] );
 				return 1;
 			}
 		} else if( is_dash_arg_prefix( argv[i], "duration", 8 ) ) {
@@ -991,9 +1474,9 @@ argv = _argv;
 			if( argv[i] != NULL ) {
 				char * endptr = NULL;
 				const char * ld = argv[i];
-				// leaseDuration = strtol( ld, & endptr, 0 );
 				double fractionHours = strtod( ld, & endptr );
 				leaseDuration = fractionHours * 60 * 60;
+				leaseDurationSpecified = true;
 				if( * endptr != '\0' ) {
 					fprintf( stderr, "%s: -duration accepts a decimal number of hours.\n", argv[0] );
 					return 1;
@@ -1004,28 +1487,28 @@ argv = _argv;
 				}
 				continue;
 			} else {
-				fprintf( stderr, "%s: -duration accepts a decimal number of hours.\n", argv[0] );
+				fprintf( stderr, "%s: -duration requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "unclaimed-timeout", 8 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "idle", 4 ) ) {
 			++i;
 			if( argv[i] != NULL ) {
 				char * endptr = NULL;
 				const char * ut = argv[i];
-				// unclaimedTimeout = strtol( ut, & endptr, 0 );
 				double fractionalHours = strtod( ut, & endptr );
 				unclaimedTimeout = fractionalHours * 60 * 60;
+				unclaimedTimeoutSpecified = true;
 				if( * endptr != '\0' ) {
-					fprintf( stderr, "%s: -unclaimed-timeout accepts a decimal number of hours.\n", argv[0] );
+					fprintf( stderr, "%s: -idle accepts a decimal number of hours.\n", argv[0] );
 					return 1;
 				}
 				if( unclaimedTimeout <= 0 ) {
-					fprintf( stderr, "%s: the unclaimed timeout must be greater than zero.\n", argv[0] );
+					fprintf( stderr, "%s: the idle time must be greater than zero.\n", argv[0] );
 					return 1;
 				}
 				continue;
 			} else {
-				fprintf( stderr, "%s: -unclaimed-timeout requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -idle requires an argument.\n", argv[0] );
 				return 1;
 			}
 		} else if( is_dash_arg_prefix( argv[i], "slots", 5 ) ) {
@@ -1039,13 +1522,13 @@ argv = _argv;
 					return 1;
 				}
 				if( count <= 0 ) {
-					fprintf( stderr, "%s: the count must be greater than zero.\n", argv[0] );
+					fprintf( stderr, "%s: the number of requested slots must be greater than zero.\n", argv[0] );
 					return 1;
 				}
 				annexTypeIsSFR = true;
 				continue;
 			} else {
-				fprintf( stderr, "%s: -count requires an argument.\n", argv[0] );
+				fprintf( stderr, "%s: -slots requires an argument.\n", argv[0] );
 				return 1;
 			}
 		} else if( is_dash_arg_prefix( argv[i], "count", 5 ) ) {
@@ -1055,11 +1538,11 @@ argv = _argv;
 				const char * ld = argv[i];
 				count = strtol( ld, & endptr, 0 );
 				if( * endptr != '\0' ) {
-					fprintf( stderr, "%s: -slots requires an integer argument.\n", argv[0] );
+					fprintf( stderr, "%s: -count requires an integer argument.\n", argv[0] );
 					return 1;
 				}
 				if( count <= 0 ) {
-					fprintf( stderr, "%s: the count must be greater than zero.\n", argv[0] );
+					fprintf( stderr, "%s: the number of requested instances must be greater than zero.\n", argv[0] );
 					return 1;
 				}
 				annexTypeIsODI = true;
@@ -1068,15 +1551,24 @@ argv = _argv;
 				fprintf( stderr, "%s: -count requires an argument.\n", argv[0] );
 				return 1;
 			}
-		} else if( is_dash_arg_prefix( argv[i], "sfr", 3 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-spot-fleet", 14 ) ) {
 			annexTypeIsSFR = true;
 			continue;
-		} else if( is_dash_arg_prefix( argv[i], "odi", 3 ) ) {
+		} else if( is_dash_arg_prefix( argv[i], "aws-on-demand", 13 ) ) {
 			annexTypeIsODI = true;
 			continue;
 		} else if( is_dash_arg_prefix( argv[i], "help", 1 ) ) {
 			help( argv[0] );
 			return 1;
+		} else if( is_dash_arg_prefix( argv[i], "check-setup", 11 ) ) {
+			return check_setup();
+		} else if( is_dash_arg_prefix( argv[i], "setup", 5 ) ) {
+			// FIXME: At some point, we should accept a region flag instead
+			// of requiring the user to specify two different URLs.
+			return setup(	argc >= 2 ? argv[2] : NULL,
+							argc >= 3 ? argv[3] : NULL,
+							argc >= 4 ? argv[4] : NULL,
+							serviceURL );
 		} else if( argv[i][0] == '-' && argv[i][1] != '\0' ) {
 			fprintf( stderr, "%s: unrecognized option (%s).\n", argv[0], argv[i] );
 			return 1;
@@ -1084,7 +1576,7 @@ argv = _argv;
 	}
 
 	if( udSpecifications > 1 ) {
-		fprintf( stderr, "%s: you may specify no more than one of -[default-]user-data[-file].\n", argv[0] );
+		fprintf( stderr, "%s: you may specify no more than one of -aws-[default-]user-data[-file].\n", argv[0] );
 		return 1;
 	}
 
@@ -1102,8 +1594,14 @@ argv = _argv;
 		leaseDuration = param_integer( "ANNEX_DEFAULT_LEASE_DURATION", 3000 );
 	}
 
+	if( unclaimedTimeout == 0 ) {
+		unclaimedTimeout = param_integer( "ANNEX_DEFAULT_UNCLAIMED_TIMEOUT", 900 );
+	}
+
 	if( annexTypeIsSFR && annexTypeIsODI ) {
-		fprintf( stderr, "You must not specify more than one of -odi and -sfr.  If you specify -sfr-config-file, you must not specify -odi.  Specifying -count implies -odi and specifying -slots implies -sfr.\n" );
+		fprintf( stderr, "An annex may not be both on-demand and spot fleet.  "
+			"Specifying -count implies -aws-on-demand; specifying -slots "
+			"implies -aws-spot-fleet.\n" );
 		return 1;
 	}
 	if(! (annexTypeIsSFR || annexTypeIsODI )) {
@@ -1113,15 +1611,20 @@ argv = _argv;
 	if( annexTypeIsSFR && sfrConfigFile == NULL ) {
 		sfrConfigFile = param( "ANNEX_DEFAULT_SFR_CONFIG_FILE" );
 		if( sfrConfigFile == NULL ) {
-			fprintf( stderr, "Spot Fleet Requests require the -sfr-config-file flag.\n" );
+			fprintf( stderr, "Spot Fleet Requests require the -aws-spot-fleet-config-file flag.\n" );
 			return 1;
 		}
 	}
 	if( sfrConfigFile != NULL && ! annexTypeIsSFR ) {
-		fprintf( stderr, "Unwilling to ignore -sfr-config-file flag being set for an ODI annex.\n" );
+		fprintf( stderr, "Unwilling to ignore -spot-fleet-request-config-file flag being set for an on-demand annex.\n" );
 		return 1;
 	}
 
+
+	//
+	// Construct enough of the command ad that we can ask the user if what
+	// we're doing is OK.
+	//
 
 	ClassAd spotFleetRequest;
 	if( sfrConfigFile != NULL ) {
@@ -1209,17 +1712,71 @@ argv = _argv;
 	time_t now = time( NULL );
 	spotFleetRequest.Assign( "EndOfLease", now + leaseDuration );
 
+
+	//
+	// Ask the user if what we're doing is OK.  If it isn't, tell the
+	// user how to change it.
+	//
+
+	if( annexTypeIsODI ) {
+		fprintf( stdout,
+			"Will request %ld %s on-demand instance%s for %.2f hours.  "
+			"Each instance will terminate after being idle for %.2f hours.\n",
+			count, odiInstanceType, count == 1 ? "" : "s",
+			leaseDuration / 3600.0, unclaimedTimeout / 3600.0
+		);
+	}
+
+	if( annexTypeIsSFR ) {
+		fprintf( stdout,
+			"Will request %ld spot instance%s for %.2f hours.  "
+			"Each instance will terminate after being idle for %.2f hours.\n",
+			count,
+			count == 1 ? "" : "s",
+			leaseDuration / 3600.0,
+			unclaimedTimeout / 3600.0
+		);
+	}
+
+	std::string response;
+	fprintf( stdout, "Is that OK?  (Type 'yes' or 'no'): " );
+	std::getline( std::cin, response );
+
+	if( strcasecmp( response.c_str(), "yes" ) != 0 ) {
+		if( annexTypeIsODI ) {
+			if(! odiInstanceTypeSpecified) {
+				fprintf( stdout, "To change the instance type, use the -aws-on-demand-instance-type flag.\n" );
+			}
+		}
+
+		if(! leaseDurationSpecified) {
+			fprintf( stdout, "To change the lease duration, use the -duration flag.\n" );
+		}
+		if(! unclaimedTimeoutSpecified) {
+			fprintf( stdout, "To change how long an idle instance will wait before terminating itself, use the -idle flag.\n" );
+		}
+
+		return 1;
+	}
+
+
+	//
+	// Build the (dynamic) configuration tarball.
+	//
+
 	std::string tarballTarget;
-	param( tarballTarget, "ANNEX_DEFAULT_ODI_S3_CONFIG_PATH" );
+	param( tarballTarget, "ANNEX_DEFAULT_S3_BUCKET" );
 	if( odiS3ConfigPath != NULL ) {
 		tarballTarget = odiS3ConfigPath;
+	} else {
+		formatstr( tarballTarget, "%s/config-%s.tar.gz",
+			tarballTarget.c_str(), annexName );
 	}
 	if( tarballTarget.empty() ) {
-		fprintf( stderr, "If you don't specify -odi-s3-config-path, ANNEX_DEFAULT_ODI_S3_CONFIG_PATH must be set in configuration.\n" );
+		fprintf( stderr, "If you don't specify -aws-s3-config-path, ANNEX_DEFAULT_S3_BUCKET must be set in configuration.\n" );
 		return 1;
 	}
 	spotFleetRequest.Assign( "UploadTo", tarballTarget );
-
 
 	// Create a temporary directory.  If a config directory was specified,
 	// copy its contents into the temporary directory.  Create (or copy)
@@ -1248,8 +1805,26 @@ argv = _argv;
 		}
 	}
 
-	std::string tarballPath, tarballError;
-	bool createdTarball = createConfigTarball( tempDir, annexName, unclaimedTimeout, tarballPath, tarballError );
+	//
+	// A job's Owner attribute is almost aways set by condor_submit to be
+	// the return of my_username(), and this value is checked by the schedd.
+	//
+	// However, if the user submitted their jobs with +Owner = undefined,
+	// then what the mapfile says goes.  Rather than have this variable
+	// be configurable (because we may end up where condor_annex doesn't
+	// have per-user configuration), just require users in this rare
+	// situation to run condor_ping -type schedd WRITE and use the
+	// answer in a config directory (or command-line argument, if that
+	// becomes a thing) for setting the START expression.
+	//
+
+	std::string tarballPath, tarballError, instanceID;
+	if(! ownerSpecified) { owner = my_username(); }
+	bool createdTarball = createConfigTarball( tempDir, annexName,
+		noOwner ? NULL : owner, unclaimedTimeout, tarballPath, tarballError,
+		instanceID );
+	if(! ownerSpecified) { free( owner ); }
+	spotFleetRequest.Assign( "CollectorInstanceID", instanceID );
 
 	// FIXME: Rewrite without system().
 	std::string cmd;
@@ -1267,6 +1842,10 @@ argv = _argv;
 	}
 
 	spotFleetRequest.Assign( "UploadFrom", tarballPath );
+
+	//
+	// Finish constructing the spot fleet request.
+	//
 
 	if( serviceURL != NULL ) {
 		spotFleetRequest.Assign( "ServiceURL", serviceURL );
@@ -1309,33 +1888,6 @@ argv = _argv;
 		}
 		free( base64Encoded );
 	}
-
-
-/*
-	if( annexTypeIsODI ) {
-		fprintf( stdout,
-			"Will request %ld %s on-demand instances for %.2f hours.  "
-			"Each instance will terminate after %.2f hours of inactivity.\n"
-			"To change to Spot instances, use the -spot flag.\n"
-			"To change the instance type, use the -odi-instance-type flag.\n"
-			"To change the lease duration, use the -duration flag.\n"
-			"To change the no-claim timeout, use the -unclaimed-timeout flag.\n",
-				count, odiInstanceType, leaseDuration / 3600.0,
-				unclaimedTimeout / 3600.0
-		);
-	} else {
-		fprintf( stdout,
-			"Will request %ld spot instances for %.2f hours.  "
-			"Each instance will terminate after %.2f hours of inactivity.\n"
-			"To change to on-demand instances, use the -odi flag.\n"
-			"To change the instance type, use the -instance-type flag.\n"
-			"To change the lease duration, use the -duration flag.\n"
-			"To change the no-claim timeout, use the -unclaimed-timeout flag.\n",
-				count, leaseDuration / 3600.0,
-				unclaimedTimeout / 3600.0
-		);
-	}
-*/
 
 
 	// -------------------------------------------------------------------------

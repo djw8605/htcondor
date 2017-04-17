@@ -6,8 +6,6 @@ use warnings;
 use Getopt::Long;
 use JSON;
 
-my $VERSION = 1;
-
 my( $prettyPrint );
 GetOptions(
 	'pretty-print'	=> \$prettyPrint
@@ -15,7 +13,7 @@ GetOptions(
 
 	my $template;
 	$template->{ AWSTemplateFormatVersion } = "2010-09-09";
-	$template->{ Description } = "Instance Configuration Role";
+	$template->{ Description } = "HTCondor Annex: Instance Profile";
 
 	$template->{ Parameters } = {
 		"S3BucketName" => {
@@ -23,7 +21,7 @@ GetOptions(
 		},
 		"S3FileName" => {
 			Type => "String",
-			Default => "config.tar.gz"
+			Default => "config-*.tar.gz"
 		}
 	};
 
@@ -83,7 +81,9 @@ GetOptions(
 									"iam:GetPolicy",
 									"iam:GetPolicyVersion",
 									"iam:ListAttachedRolePolicies",
-									"iam:ListRolePolicies"
+									"iam:ListRolePolicies",
+									"ec2:DescribeInstances",
+									"ec2:DescribeSpotFleetRequests"
 								],
 								Resource => "*"
 							}

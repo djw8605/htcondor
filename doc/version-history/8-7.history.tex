@@ -12,6 +12,36 @@ This is the development release series of HTCondor.
 The details of each version are described below.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection*{\label{sec:New-8-7-2}Version 8.7.2}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\noindent Release Notes:
+
+\begin{itemize}
+
+\item HTCondor version 8.7.2 not yet released.
+%\item HTCondor version 8.7.2 released on Month Date, 2017.
+
+\end{itemize}
+
+
+\noindent New Features:
+
+\begin{itemize}
+
+\item None.
+
+\end{itemize}
+
+\noindent Bugs Fixed:
+
+\begin{itemize}
+
+\item None.
+
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subsection*{\label{sec:New-8-7-1}Version 8.7.1}
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -29,8 +59,27 @@ The details of each version are described below.
 
 \begin{itemize}
 
-\item None.
+\item Docker universe detection is now more robust in the
+face of extraneous output to standard error on docker startup.
+This was preventing Condor from detecting that docker was properly
+working on hosts.
+\Ticket{6185}
 
+\item Docker universe jobs can now use condor\_chirp command
+(if it is in the image).
+\Ticket{6162}
+
+\item Increased the default value for configuration parameter
+\MacroNI{NEGOTIATOR\_SOCKET\_CACHE\_SIZE} to 500.
+\Ticket{6165}
+
+\item Added new DaemonCore statistics UdpQueueDepth to measure the
+number of bytes in the UDP receive queue for daemons with a UDP command port.
+\Ticket{6183}
+
+\item Improved speed of handling queries to the collector by caching the 
+config knob SHARED\_PORT\_ADDRESS\_REWRITING
+\Ticket{6187}
 \end{itemize}
 
 \noindent Bugs Fixed:
@@ -49,8 +98,7 @@ The details of each version are described below.
 
 \begin{itemize}
 
-\item HTCondor version 8.7.0 not yet released.
-%\item HTCondor version 8.7.0 released on Month Date, 2017.
+\item HTCondor version 8.7.0 released on March 2, 2017.
 
 \end{itemize}
 
@@ -59,7 +107,39 @@ The details of each version are described below.
 
 \begin{itemize}
 
-\item None.
+\item Optimized the code that reads reads ClassAds off the wire making the maximum possible update rate
+for the Collector about 1.7 times higher than it was before.
+\Ticket{6105}
+\Ticket{6130}
+
+\item New statistics have been added to the Collector ad to show time spent handling queries.
+\Ticket{6123}
+
+\item Changed the formatting of the printing of ClassAd expressions with
+parentheses. Now there is no space character after every open parenthesis, or
+before every close parenthesis
+This looks more natural, is somewhat faster for the condor to parse, and
+saves space.  That is, an expression that used to print like
+
+\begin{verbatim}
+( ( ( foo ) ) )
+\end{verbatim}
+now will print like this
+\begin{verbatim}
+(((foo)))
+\end{verbatim}
+\Ticket{6082}
+
+\item Technology preview of the HTCondor Annex. The HTCondor Annex allows one
+to extend their HTCondor pool into the cloud.
+\URL{https://htcondor-wiki.cs.wisc.edu/index.cgi/wiki?p=HowToUseCondorAnnexWithOnDemandInstances}
+\Ticket{6121}
+
+\item Added \Opt{-annex} option to \Condor{status} and \Condor{off}.  Requires
+an argument; the request is constrained to match machines whose
+\Expr{AnnexName} ClassAd attribute matches the argument.
+\Ticket{6116}
+\Ticket{6117}
 
 \end{itemize}
 
@@ -67,7 +147,8 @@ The details of each version are described below.
 
 \begin{itemize}
 
-\item None.
+\item Removed redundant updates to the job queue by the Job Router.
+\Ticket{6102}
 
 \end{itemize}
 
