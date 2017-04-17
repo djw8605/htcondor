@@ -22,6 +22,8 @@ include(FindPkgConfig)
 pkg_check_modules(GLOBUS_COMMON globus-common)
 include_directories(${GLOBUS_COMMON_INCLUDE_DIRS})
 
+message(WARNING "Include DIR: ${ClassAd_LIBRARY}") 
+
 pkg_check_modules(GLOBUS_IO globus-io)
 pkg_check_modules(GLOBUS_GSSAPI_GSI globus-gssapi-gsi)
 pkg_check_modules(GLOBUS_GSS_ASSIST globus-gss-assist)
@@ -42,8 +44,8 @@ set (bupdater_common_sources
 
 # programs for 'sbin'
 add_executable(blahpd_daemon main_daemon.c ${main_common_sources})
-set_target_properties(blahpd_daemon PROPERTIES COMPILE_FLAGS ${ClassAd_CXX_FLAGS}) 
-target_link_libraries(blahpd_daemon -lpthread ${ClassAd_LIBRARY})
+#set_target_properties(blahpd_daemon PROPERTIES COMPILE_FLAGS ${CLASSADS_FOUND}) 
+target_link_libraries(blahpd_daemon -lpthread ${CONDOR_TOOL_LIBS})
 add_executable(blah_job_registry_add 
     blah_job_registry_add.c job_registry.c 
     job_registry_updater.c md5.c config.c)
@@ -52,8 +54,8 @@ add_executable(blah_job_registry_lkup
 add_executable(blah_job_registry_scan_by_subject 
     blah_job_registry_scan_by_subject.c classad_c_helper.C
     classad_binary_op_unwind.C job_registry.c md5.c config.c)
-set_target_properties(blah_job_registry_scan_by_subject PROPERTIES COMPILE_FLAGS ${ClassAd_CXX_FLAGS}) 
-target_link_libraries(blah_job_registry_scan_by_subject ${ClassAd_LIBRARY})
+#set_target_properties(blah_job_registry_scan_by_subject PROPERTIES COMPILE_FLAGS ${CLASSADS_FOUND}) 
+target_link_libraries(blah_job_registry_scan_by_subject ${CONDOR_TOOL_LIBS})
 add_executable(blah_check_config
     blah_check_config.c Bfunctions.c config.c blah_utils.c)
 add_executable(blah_job_registry_dump
@@ -63,8 +65,8 @@ add_executable(blah_job_registry_purge
 
 # programs for 'bin'
 add_executable(blahpd main.c ${main_common_sources})
-set_target_properties(blahpd PROPERTIES COMPILE_FLAGS ${ClassAd_CXX_FLAGS}) 
-target_link_libraries(blahpd -lpthread ${ClassAd_LIBRARY})
+#set_target_properties(blahpd PROPERTIES COMPILE_FLAGS ${CLASSADS_FOUND}) 
+target_link_libraries(blahpd -lpthread ${CONDOR_TOOL_LIBS})
 
 # programs for 'libexec'
 add_executable(BLClient BLClient.c blah_utils.c BLfunctions.c)
@@ -88,15 +90,17 @@ add_executable(blparser_master blparser_master.c config.c blah_utils.c)
 
 if (${GLOBUS_COMMON_FOUND} AND ${GLOBUS_IO_FOUND})
 add_executable(BPRclient BPRclient.c BPRcomm.c tokens.c)
-target_link_libraries(BPRclient 
+target_link_libraries(BPRclient  -lpthread -lm
   ${GLOBUS_GSI_PROXY_CORE_LDFLAGS}
   ${GLOBUS_GSI_CREDENTIALS_LDFLAGS}
-  ${GLOBUS_GSS_ASSIST_LDFLAGS})
+  ${GLOBUS_GSS_ASSIST_LDFLAGS}  
+  ${CONDOR_TOOL_LIBS})
 add_executable(BPRserver BPRserver.c BPRcomm.c tokens.c)
 target_link_libraries(BPRserver
   ${GLOBUS_GSI_PROXY_CORE_LDFLAGS}
   ${GLOBUS_GSI_CREDENTIALS_LDFLAGS}
-  ${GLOBUS_GSS_ASSIST_LDFLAGS})
+  ${GLOBUS_GSS_ASSIST_LDFLAGS}
+  ${CONDOR_TOOL_LIBS})
 set_target_properties(BPRserver PROPERTIES COMPILE_FLAGS "-static") 
 endif (${GLOBUS_COMMON_FOUND} AND ${GLOBUS_IO_FOUND})
 
@@ -113,17 +117,17 @@ set_target_properties(test_cmdbuffer PROPERTIES COMPILE_FLAGS "-DCMDBUF_DEBUG")
 
 # CPack info
 
-install(TARGETS blahpd RUNTIME DESTINATION bin)
+install(TARGETS blahpd RUNTIME DESTINATION ${C_SBIN})
 install(TARGETS
     blahpd_daemon blah_job_registry_add blah_job_registry_lkup
     blah_job_registry_scan_by_subject blah_check_config 
     blah_job_registry_dump blah_job_registry_purge
-    RUNTIME DESTINATION sbin)
+    RUNTIME DESTINATION ${C_SBIN})
 install(TARGETS 
     BLClient BLParserLSF BLParserPBS BUpdaterCondor BNotifier 
     BUpdaterLSF BUpdaterPBS BUpdaterSGE
     blparser_master
-    RUNTIME DESTINATION libexec)
+    RUNTIME DESTINATION ${C_LIBEXEC})
 
 set(blah_scripts
     scripts/blah_load_config.sh scripts/blah_common_submit_functions.sh
@@ -147,10 +151,10 @@ install(FILES
     PERMISSIONS OWNER_WRITE OWNER_READ OWNER_EXECUTE
                 GROUP_READ GROUP_EXECUTE
                 WORLD_READ WORLD_EXECUTE
-    DESTINATION libexec)
+    DESTINATION ${C_LIBEXEC})
 
 if (${GLOBUS_COMMON_FOUND} AND ${GLOBUS_IO_FOUND})
-install(TARGETS BPRclient BPRserver RUNTIME DESTINATION libexec)
+install(TARGETS BPRclient BPRserver RUNTIME DESTINATION ${C_LIBEXEC})
 endif (${GLOBUS_COMMON_FOUND} AND ${GLOBUS_IO_FOUND})
 
 include(CPack)

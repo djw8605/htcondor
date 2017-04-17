@@ -42,8 +42,8 @@ set(CPACK_PACKAGE_VERSION
 
 # For the following setting, see CMAKE manual, page 155
 # or http://public.kitware.com/Bug/view.php?id=7000
-set(CPACK_SET_DESTDIR ON)
-set(CPACK_PACKAGE_RELOCATABLE "false")
+#set(CPACK_SET_DESTDIR ON)
+#set(CPACK_PACKAGE_RELOCATABLE "false")
 
 set(CPACK_PACKAGE_CONTACT "blah@mi.infn.it")
 set(CPACK_RPM_PACKAGE_LICENSE "Apache Software License")
@@ -54,9 +54,10 @@ set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
 set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE 
     ${CMAKE_CURRENT_SOURCE_DIR}/project/glite-ce-blahp.preun)
 
+
 add_subdirectory(src build)
 add_subdirectory(config)
-add_subdirectory(doc)
+#add_subdirectory(doc)
 
 install(FILES LICENSE 
     DESTINATION share/doc/${CMAKE_PROJECT_NAME}-${CPACK_PACKAGE_VERSION})
