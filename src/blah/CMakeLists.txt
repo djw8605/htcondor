@@ -55,6 +55,10 @@ set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/project/glite-ce-blahp.preun)
 
 
+set(BLAH_DIR ${C_LIBEXEC}/blah)
+set(BLAH_BIN ${BLAH_DIR}/bin)
+set(BLAH_ETC ${BLAH_ETC}/etc)
+
 add_subdirectory(src build)
 add_subdirectory(config)
 #add_subdirectory(doc)

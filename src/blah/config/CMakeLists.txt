@@ -18,7 +18,7 @@ cmake_minimum_required(VERSION 2.6)
 install(FILES 
     blah.config.template 
     blparser.conf.template
-    DESTINATION ${C_ETC} )
+    DESTINATION ${BLAH_ETC} )
 
 #install(FILES 
 #    glite-ce-blah-parser

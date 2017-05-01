@@ -117,17 +117,17 @@ set_target_properties(test_cmdbuffer PROPERTIES COMPILE_FLAGS "-DCMDBUF_DEBUG")
 
 # CPack info
 
-install(TARGETS blahpd RUNTIME DESTINATION ${C_SBIN})
+install(TARGETS blahpd RUNTIME DESTINATION ${BLAH_BIN})
 install(TARGETS
     blahpd_daemon blah_job_registry_add blah_job_registry_lkup
     blah_job_registry_scan_by_subject blah_check_config 
     blah_job_registry_dump blah_job_registry_purge
-    RUNTIME DESTINATION ${C_SBIN})
+    RUNTIME DESTINATION ${BLAH_BIN})
 install(TARGETS 
     BLClient BLParserLSF BLParserPBS BUpdaterCondor BNotifier 
     BUpdaterLSF BUpdaterPBS BUpdaterSGE
     blparser_master
-    RUNTIME DESTINATION ${C_LIBEXEC})
+    RUNTIME DESTINATION ${BLAH_BIN})
 
 set(blah_scripts
     scripts/blah_load_config.sh scripts/blah_common_submit_functions.sh
@@ -151,10 +151,10 @@ install(FILES
     PERMISSIONS OWNER_WRITE OWNER_READ OWNER_EXECUTE
                 GROUP_READ GROUP_EXECUTE
                 WORLD_READ WORLD_EXECUTE
-    DESTINATION ${C_LIBEXEC})
+    DESTINATION ${BLAH_BIN})
 
 if (${GLOBUS_COMMON_FOUND} AND ${GLOBUS_IO_FOUND})
-install(TARGETS BPRclient BPRserver RUNTIME DESTINATION ${C_LIBEXEC})
+install(TARGETS BPRclient BPRserver RUNTIME DESTINATION ${BLAH_BIN})
 endif (${GLOBUS_COMMON_FOUND} AND ${GLOBUS_IO_FOUND})
 
 include(CPack)
