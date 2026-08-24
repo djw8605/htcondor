@@ -156,6 +156,75 @@ start_ssh () {
 
 }    
 
+# --- BEGIN ce_control helpers ---
+# The site-side red button. These live between markers so the test suite can
+# extract and exercise them; this script has no main() guard and cannot be
+# sourced whole.
+
+# Install the button in the remote home directory.
+#
+# Deliberately NOT under ~/bosco: the install rsync below runs with --delete and
+# protects only sandbox/*, so anything placed inside ~/bosco is removed on the
+# next push -- including the very tool a site would use to stop a misbehaving
+# CE. Outside that tree, --delete cannot reach it.
+install_ce_control () {
+    local host=$1
+    local source_script=$2
+
+    if [ ! -r "$source_script" ]; then
+        echo "Warning: cannot install ce_control: $source_script not readable" >&2
+        return 1
+    fi
+
+    # $ssh_args carries the port as ssh spells it (-p); scp spells it -P.
+    local scp_args=""
+    if [[ ${ssh_args:-} =~ -p[[:space:]]+([0-9]+) ]]; then
+        scp_args="-P ${BASH_REMATCH[1]}"
+    fi
+
+    scp -q $scp_args "$source_script" "$host:ce_control" 2>/dev/null || {
+        echo "Warning: failed to install ce_control on $host" >&2
+        return 1
+    }
+    ssh ${ssh_args:-} "$host" "chmod 755 ~/ce_control" 2>/dev/null
+    return 0
+}
+
+# Refuse to quietly reinstall over a site that has stopped this CE.
+#
+# Installing does not clear the flag -- the freshly pushed submit scripts still
+# honour it -- but a re-push must never *look* like it restored service.
+warn_if_ce_stopped () {
+    local host=$1
+    local probe
+
+    probe=$(ssh ${ssh_args:-} "$host" \
+        "if [ -e ~/.ce_stop ]; then head -n 1 ~/.ce_stop; echo '__CE_STOPPED__'; fi" \
+        2>/dev/null)
+
+    case "$probe" in
+        *__CE_STOPPED__*) : ;;
+        *) return 1 ;;
+    esac
+
+    local reason
+    reason=$(printf '%s\n' "$probe" | grep -v '__CE_STOPPED__' | head -n 1)
+
+    echo "" >&2
+    echo "***********************************************************************" >&2
+    echo "WARNING: the administrator of $host has STOPPED this CE." >&2
+    echo "" >&2
+    echo "  Flag file: ~/.ce_stop on $host" >&2
+    echo "  Reason:    ${reason:-(none given)}" >&2
+    echo "" >&2
+    echo "  Installing does NOT restore service: submissions stay blocked until" >&2
+    echo "  that site runs '~/ce_control resume'. Contact them before proceeding." >&2
+    echo "***********************************************************************" >&2
+    echo "" >&2
+    return 0
+}
+# --- END ce_control helpers ---
+
 display_dots () {
     while [ 1 ]; do
         # Get parent ID
@@ -807,6 +876,10 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# If the site has pressed the red button, say so loudly before installing over
+# them. Installing does not lift the block, but it must not look like it did.
+warn_if_ce_stopped "$ssh_host"
+
 if [ "$cluster_type" == "pbs" ]; then
     # Get the queue information
     echo -n "Detecting PBS cluster configuration..."
@@ -993,6 +1066,22 @@ fi
 # Delete any old files, but save everything in the sanbdox directory.
 show_progress "Installing on cluster $remote_host" rsync --delete "--filter=protect sandbox/*" "--filter=protect .nfs*" -aqK -e "ssh -o ControlMaster=auto -o ControlPath=$ssh_control_path $ssh_args" "$local_install_dir" $ssh_host:
 exit_code=$?
+
+# Plant the site-side red button, while the ssh ControlMaster is still up.
+# It goes in the remote home directory rather than under bosco/, so the
+# --delete above cannot remove it on any future install.
+if [ "$exit_code" -eq 0 ]; then
+    ce_control_source="$(dirname "$0")/ce_control"
+    if [ ! -r "$ce_control_source" ]; then
+        ce_control_source=$(command -v ce_control 2>/dev/null)
+    fi
+    if [ -n "$ce_control_source" ] && [ -r "$ce_control_source" ]; then
+        install_ce_control "$ssh_host" "$ce_control_source"
+    else
+        echo "Warning: ce_control not found next to $0; the site-side stop" >&2
+        echo "         command was not installed on $remote_host." >&2
+    fi
+fi
 
 rm -rf $tmp_install_dir
 # Removing temporary directory

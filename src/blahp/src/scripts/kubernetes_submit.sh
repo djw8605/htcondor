@@ -32,6 +32,11 @@
 
 . `dirname $0`/blah_load_config.sh
 
+# This script does not use bls_parse_submit_options, so the site-side
+# submission block has to be invoked explicitly.
+. `dirname $0`/blah_common_submit_functions.sh
+bls_check_stop_flag
+
 usage_string="Usage: $0 -c <command> [-i <stdin>] [-o <stdout>] [-e <stderr>] [-v <environment>] [-s <yes | no>] [-- command_arguments]"
 
 workdir=$PWD

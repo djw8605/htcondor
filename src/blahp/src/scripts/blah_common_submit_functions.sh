@@ -261,8 +261,38 @@ function bls_fl_clear ()
   eval "unset bls_${container_name}_counter"
 }
 
+function bls_check_stop_flag ()
+{
+#
+# Site-side submission block. If the flag file exists, the local administrator
+# has stopped this CE (see the ce_control command), so refuse to submit.
+#
+# The message is written to stderr and the script exits non-zero. blahpd's
+# cmd_submit_job embeds both streams into its result line, which the gridmanager
+# turns into the job's HoldReason -- so this text is what the CE operator sees.
+# That path escapes spaces and truncates at 1024 bytes, hence the single-line,
+# length-capped, control-character-free message.
+#
+  local stop_file
+  stop_file="${blah_stop_submission_file:-$HOME/.ce_stop}"
+
+  [ -e "$stop_file" ] || return 0
+
+  local stop_message
+  stop_message=$(head -n 1 "$stop_file" 2>/dev/null | tr -d '[:cntrl:]' | cut -c 1-200)
+
+  if [ -z "$stop_message" ]; then
+    stop_message="no reason given (flag file: $stop_file)"
+  fi
+
+  echo "1ERROR: CE submission disabled by site administrator: $stop_message" >&2
+  exit 1
+}
+
 function bls_parse_submit_options ()
 {
+  bls_check_stop_flag
+
   usage_string="Usage: $0 -c <command> [-i <stdin>] [-o <stdout>] [-e <stderr>] [-x <x509userproxy>] [-v <environment>] [-s <yes | no>] [-- command_arguments]"
 
   bls_opt_stgcmd="yes"

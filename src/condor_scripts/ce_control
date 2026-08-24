@@ -1,0 +1,723 @@
+#!/bin/bash
+#
+# ce_control -- site-side red button for a hosted HTCondor-CE.
+#
+# Lets the administrator of an execution site stop a CE that submits into their
+# batch system over ssh (the Bosco/blahp path), without needing any access to
+# the CE itself.
+#
+# Deliberately self-contained: it sources nothing from ~/bosco, because
+# `lockout` has to keep working after ~/bosco is broken, emptied, or gone.
+#
+# Copyright (c) HTCondor Team, Computer Sciences Department,
+#   University of Wisconsin-Madison, WI.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+set -u
+
+PROG=$(basename "$0")
+
+BOSCO_DIR="$HOME/bosco"
+STOP_FLAG="$HOME/.ce_stop"
+STATE_DIR="$HOME/.ce_control"
+KEY_BACKUP="$STATE_DIR/authorized_keys.bak"
+AUTHORIZED_KEYS="$HOME/.ssh/authorized_keys"
+
+# Exit codes (see the design spec, section 6.6)
+EXIT_OK=0
+EXIT_USAGE=1
+EXIT_RESIDUAL=2
+EXIT_NOT_DRAINED=3
+
+usage() {
+    cat <<EOF
+Usage: $PROG <command> [options]
+
+Stop a hosted HTCondor-CE from submitting into this cluster, and clean up
+after the jobs it already submitted.
+
+Commands:
+  status              Report the current state. Read-only. The default.
+  stop                Block new submissions, cancel and drain existing jobs,
+                      then remove head-node sandbox directories.
+  lockout             Everything stop does, then sever the CE's ssh access.
+  resume              Undo stop and lockout.
+
+Options:
+  -m, --message TEXT  Reason shown to the CE operator as the job's hold reason.
+  -g, --grace SECS    Seconds to wait for jobs to exit after SIGTERM (default 120).
+  -n, --dry-run       Report what would happen; change nothing.
+  -y, --yes           Do not prompt for confirmation.
+      --keep-sandboxes  Cancel and drain, but leave sandbox directories in place.
+  -h, --help          This message.
+
+Exit codes:
+  0  clean
+  1  usage or precondition error; nothing was changed
+  2  completed, but residual state was reported
+  3  jobs would not drain; sandboxes deliberately left intact (re-runnable)
+EOF
+}
+
+die() {
+    echo "$PROG: $*" >&2
+    exit $EXIT_USAGE
+}
+
+# --- batch system discovery -------------------------------------------------
+
+# Resolve a batch tool, preferring the path blah.config records over $PATH.
+find_batch_tool() {
+    local tool=$1 knob=$2 binpath=""
+    if [ -r "$BOSCO_DIR/glite/etc/blah.config" ]; then
+        binpath=$(sed -n "s/^[[:space:]]*${knob}[[:space:]]*=[[:space:]]*//p" \
+                  "$BOSCO_DIR/glite/etc/blah.config" | tail -n 1 | tr -d '"' | tr -d "'")
+    fi
+    if [ -n "$binpath" ] && [ -x "$binpath/$tool" ]; then
+        echo "$binpath/$tool"
+        return 0
+    fi
+    command -v "$tool" 2>/dev/null
+}
+
+# Sets BATCH_SYSTEM and the tool paths for whichever system was found.
+detect_batch_system() {
+    BATCH_SYSTEM="unknown"
+    SQUEUE="" ; SCANCEL="" ; QSELECT="" ; QDEL="" ; CONDOR_Q="" ; CONDOR_RM=""
+
+    SQUEUE=$(find_batch_tool squeue slurm_binpath)
+    SCANCEL=$(find_batch_tool scancel slurm_binpath)
+    if [ -n "$SQUEUE" ] && [ -n "$SCANCEL" ]; then
+        BATCH_SYSTEM="slurm"
+        return 0
+    fi
+
+    QSELECT=$(find_batch_tool qselect pbs_binpath)
+    QDEL=$(find_batch_tool qdel pbs_binpath)
+    if [ -n "$QSELECT" ] && [ -n "$QDEL" ]; then
+        BATCH_SYSTEM="pbs"
+        return 0
+    fi
+
+    CONDOR_Q=$(find_batch_tool condor_q condor_binpath)
+    CONDOR_RM=$(find_batch_tool condor_rm condor_binpath)
+    if [ -n "$CONDOR_Q" ] && [ -n "$CONDOR_RM" ]; then
+        BATCH_SYSTEM="condor"
+        return 0
+    fi
+
+    return 0
+}
+
+batch_is_supported() {
+    case "$BATCH_SYSTEM" in
+        slurm|pbs|condor) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Only Slurm gets the two-phase signal treatment. There, SIGTERM can be aimed at
+# the batch shell specifically, which is where the blahp wrapper's cleanup trap
+# lives. PBS and HTCondor get the thin equivalent: a normal removal (which their
+# schedulers already implement as SIGTERM-then-SIGKILL) escalating to a forced
+# one.
+batch_has_signal_phase() {
+    [ "$BATCH_SYSTEM" = "slurm" ]
+}
+
+# --- sandbox discovery ------------------------------------------------------
+
+# Read BOSCO_SANDBOX_DIR out of the ft-gahp config rather than assuming it.
+sandbox_dir() {
+    local cfg="$BOSCO_DIR/glite/etc/condor_config.ft-gahp" path=""
+    [ -r "$cfg" ] || return 1
+    path=$(sed -n 's/^[[:space:]]*BOSCO_SANDBOX_DIR[[:space:]]*=[[:space:]]*//p' "$cfg" | tail -n 1)
+    [ -n "$path" ] || return 1
+    # condor_config syntax: $ENV(HOME) and $(HOME) both mean the home directory.
+    path=${path//\$ENV(HOME)/$HOME}
+    path=${path//\$(HOME)/$HOME}
+    echo "$path"
+}
+
+count_sandboxes() {
+    local dir
+    dir=$(sandbox_dir) || { echo 0; return; }
+    [ -d "$dir" ] || { echo 0; return; }
+    find "$dir" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
+# --- job inventory ----------------------------------------------------------
+
+# Job IDs owned by this account, optionally filtered by RUNNING or PENDING.
+# Assumption A1: the account is dedicated to one CE, so ownership is the
+# inventory -- no per-job tagging is needed to tell CE jobs from anything else.
+list_jobs() {
+    local state="${1:-}"
+    case "$BATCH_SYSTEM" in
+        slurm)
+            if [ -n "$state" ]; then
+                "$SQUEUE" -h -u "$USER" -o '%i' --state="$state" 2>/dev/null
+            else
+                "$SQUEUE" -h -u "$USER" -o '%i' 2>/dev/null
+            fi
+            ;;
+        pbs)
+            case "$state" in
+                RUNNING) "$QSELECT" -u "$USER" -s R 2>/dev/null ;;
+                PENDING) "$QSELECT" -u "$USER" -s Q 2>/dev/null ;;
+                *)       "$QSELECT" -u "$USER" 2>/dev/null ;;
+            esac
+            ;;
+        condor)
+            case "$state" in
+                RUNNING) "$CONDOR_Q" "$USER" -constraint 'JobStatus==2' \
+                             -autoformat ClusterId ProcId 2>/dev/null | tr ' ' '.' ;;
+                PENDING) "$CONDOR_Q" "$USER" -constraint 'JobStatus==1' \
+                             -autoformat ClusterId ProcId 2>/dev/null | tr ' ' '.' ;;
+                *)       "$CONDOR_Q" "$USER" -autoformat ClusterId ProcId 2>/dev/null | tr ' ' '.' ;;
+            esac
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+count_jobs() {
+    list_jobs "${1:-}" | grep -c . || true
+}
+
+# Clear the backlog. Slurm can target queued jobs precisely; the others cannot
+# without listing them, so they fold this into the removal step below.
+batch_cancel_pending() {
+    [ "$BATCH_SYSTEM" = "slurm" ] || return 0
+    "$SCANCEL" --state=PENDING -u "$USER" >/dev/null 2>&1
+    return 0
+}
+
+# The polite removal: give the job a chance to run its cleanup trap.
+batch_signal_running() {
+    local ids
+    case "$BATCH_SYSTEM" in
+        slurm)
+            # --full is essential. Without it Slurm signals only job steps, and
+            # the blahp wrapper's trap lives in the batch shell.
+            "$SCANCEL" --signal=TERM --full --state=RUNNING -u "$USER" >/dev/null 2>&1
+            ;;
+        pbs)
+            ids=$(list_jobs) ; [ -n "$ids" ] || return 0
+            # shellcheck disable=SC2086
+            "$QDEL" $ids >/dev/null 2>&1
+            ;;
+        condor)
+            "$CONDOR_RM" "$USER" >/dev/null 2>&1
+            ;;
+    esac
+    return 0
+}
+
+# The hard removal, once the grace period is spent.
+batch_cancel_hard() {
+    local ids
+    case "$BATCH_SYSTEM" in
+        slurm)
+            "$SCANCEL" -u "$USER" >/dev/null 2>&1
+            ;;
+        pbs)
+            ids=$(list_jobs) ; [ -n "$ids" ] || return 0
+            # shellcheck disable=SC2086
+            "$QDEL" -W force $ids >/dev/null 2>&1
+            ;;
+        condor)
+            "$CONDOR_RM" -forcex "$USER" >/dev/null 2>&1
+            ;;
+    esac
+    return 0
+}
+
+# --- concurrency ------------------------------------------------------------
+
+LOCK_DIR="$STATE_DIR/lock"
+LOCK_HELD=no
+
+release_lock() {
+    [ "$LOCK_HELD" = yes ] || return 0
+    LOCK_HELD=no
+    rm -rf "$LOCK_DIR"
+}
+
+# mkdir is atomic everywhere POSIX, and unlike flock needs no extra binary on
+# the login node. A lock whose owner is gone is reclaimed rather than blocking
+# the button forever.
+acquire_lock() {
+    local pid
+    mkdir -p "$STATE_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            die "another $PROG run is already running (pid $pid); refusing to proceed"
+        fi
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null || die "could not acquire lock $LOCK_DIR"
+    fi
+    LOCK_HELD=yes
+    trap release_lock EXIT INT TERM
+    echo $$ > "$LOCK_DIR/pid"
+    return 0
+}
+
+# --- ssh key state ----------------------------------------------------------
+
+CE_KEY_MARKER="# disabled by ce_control"
+
+keys_are_locked() {
+    [ -r "$AUTHORIZED_KEYS" ] || return 1
+    grep -q "^${CE_KEY_MARKER}" "$AUTHORIZED_KEYS" 2>/dev/null
+}
+
+# --- status -----------------------------------------------------------------
+
+cmd_status() {
+    detect_batch_system
+
+    echo "CE control status for $USER on $(hostname)"
+    echo
+
+    if [ -e "$STOP_FLAG" ]; then
+        local msg mtime
+        msg=$(head -n 1 "$STOP_FLAG" 2>/dev/null)
+        mtime=$(ls -l "$STOP_FLAG" 2>/dev/null | awk '{print $6, $7, $8}')
+        echo "  Submissions:  STOPPED since $mtime"
+        echo "  Reason:       ${msg:-(none given)}"
+    else
+        echo "  Submissions:  not stopped"
+    fi
+
+    if keys_are_locked; then
+        echo "  SSH access:   LOCKED OUT (keys commented out in $AUTHORIZED_KEYS)"
+    else
+        echo "  SSH access:   active"
+    fi
+
+    echo "  Batch system: $BATCH_SYSTEM"
+    if batch_is_supported; then
+        echo "  Jobs:         $(count_jobs RUNNING) running, $(count_jobs PENDING) pending"
+    else
+        echo "  Jobs:         not counted (no supported batch system detected)"
+    fi
+    echo "  Sandboxes:    $(count_sandboxes) directories"
+
+    return $EXIT_OK
+}
+
+# --- stop -------------------------------------------------------------------
+
+# How often to poll the queue while draining. Short grace windows imply a test
+# or an urgent operator, so poll tightly; otherwise stay easy on the scheduler.
+poll_interval() {
+    if [ "$OPT_GRACE" -lt 20 ]; then echo 1; else echo 5; fi
+}
+
+# Window granted to the hard cancel after the grace period expires. Capped by
+# the grace period so a deliberately short run stays short.
+hard_cancel_window() {
+    if [ "$OPT_GRACE" -lt 30 ]; then echo "$OPT_GRACE"; else echo 30; fi
+}
+
+confirm() {
+    local prompt="$1" reply
+    [ "$OPT_YES" = yes ] && return 0
+    [ "$OPT_DRY_RUN" = yes ] && return 0
+    if [ ! -t 0 ]; then
+        die "refusing to run unconfirmed with no terminal; pass -y to proceed"
+    fi
+    printf '%s [y/N] ' "$prompt"
+    read -r reply
+    case "$reply" in
+        y|Y|yes|YES) return 0 ;;
+        *) echo "Aborted; nothing was changed."; exit $EXIT_USAGE ;;
+    esac
+}
+
+write_stop_flag() {
+    local msg="$OPT_MESSAGE"
+    if [ -z "$msg" ]; then
+        msg="stopped by the site administrator on $(hostname) at $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    fi
+    # One line, no control characters: this text is embedded in blahpd's result
+    # line and becomes the job's HoldReason on the CE.
+    printf '%s\n' "$msg" | head -n 1 | tr -d '[:cntrl:]' | cut -c 1-200 > "$STOP_FLAG"
+}
+
+# Remove everything inside the sandbox root, leaving the root itself.
+sweep_sandboxes() {
+    local dir removed
+    dir=$(sandbox_dir) || { echo "  Sandboxes:  no BOSCO_SANDBOX_DIR configured; nothing swept"; return 0; }
+    if [ ! -d "$dir" ]; then
+        echo "  Sandboxes:  $dir does not exist; nothing swept"
+        return 0
+    fi
+    # Never sweep outside the home directory, whatever the config says.
+    case "$dir" in
+        "$HOME"/*) : ;;
+        *) echo "  Sandboxes:  refusing to sweep $dir (outside \$HOME)" >&2; return 1 ;;
+    esac
+    removed=$(count_sandboxes)
+    find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+    echo "  Sandboxes:  removed $removed directories from $dir"
+    return 0
+}
+
+# The drain: poll until the queue empties or the deadline passes. Re-issues the
+# pending cancel each pass so jobs that slip into the queue do not escape.
+# Returns 0 if the queue emptied, 1 on timeout.
+drain_queue() {
+    local deadline=$1 interval
+    interval=$(poll_interval)
+    while [ "$(count_jobs)" -gt 0 ]; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            return 1
+        fi
+        batch_cancel_pending
+        sleep "$interval"
+    done
+    return 0
+}
+
+cmd_stop() {
+    detect_batch_system
+
+    local running pending sandboxes
+    running=$(count_jobs RUNNING)
+    pending=$(count_jobs PENDING)
+    sandboxes=$(count_sandboxes)
+
+    if [ "$OPT_DRY_RUN" = yes ]; then
+        echo "Dry run: nothing will be changed."
+        echo "  would write the stop flag to $STOP_FLAG"
+        if batch_is_supported; then
+            echo "  would cancel $pending pending and signal $running running jobs owned by $USER ($BATCH_SYSTEM)"
+        else
+            echo "  would not cancel jobs: no supported batch system detected"
+        fi
+        if [ "$OPT_KEEP_SANDBOXES" = yes ]; then
+            echo "  would keep $sandboxes sandbox directories (--keep-sandboxes)"
+        else
+            echo "  would remove $sandboxes sandbox directories"
+        fi
+        return $EXIT_OK
+    fi
+
+    confirm "Stop this CE: block submissions, cancel $running running and $pending pending jobs, remove $sandboxes sandboxes?"
+
+    mkdir -p "$STATE_DIR"
+
+    # 1. Block new submissions before touching anything else.
+    write_stop_flag
+    echo "  Submissions: blocked via $STOP_FLAG"
+
+    if ! batch_is_supported; then
+        echo "  Jobs:       not cancelled -- no supported batch system detected." >&2
+        echo "              Cancel them by hand, then re-run to sweep sandboxes." >&2
+        return $EXIT_RESIDUAL
+    fi
+
+    # 2. Clear the backlog first: pending jobs have no worker-node directory yet,
+    #    and removing them stops fresh jobs launching partway through the drain.
+    batch_cancel_pending
+    [ "$BATCH_SYSTEM" = "slurm" ] && echo "  Pending:    cancelled $pending jobs"
+
+    # 3. Polite removal, so the blahp wrapper's cleanup trap gets to run and
+    #    remove the job's worker-node directory before the job goes away.
+    batch_signal_running
+    if batch_has_signal_phase; then
+        echo "  Running:    sent SIGTERM to $running jobs, waiting up to ${OPT_GRACE}s"
+    else
+        echo "  Jobs:       requested removal of $((running + pending)) jobs, waiting up to ${OPT_GRACE}s"
+    fi
+
+    # 4. Drain.
+    local drained=no killed=0
+    if drain_queue $(( $(date +%s) + OPT_GRACE )); then
+        drained=yes
+        echo "  Drain:      queue empty; no hard cancel needed"
+    else
+        # 5. Hard cancel. These jobs ignored SIGTERM, so their cleanup trap never
+        #    completed: SIGKILL strands their worker-node directories (R1).
+        killed=$(count_jobs)
+        echo "  Drain:      $killed jobs did not exit within ${OPT_GRACE}s; hard-cancelling" >&2
+        batch_cancel_hard
+
+        # 6. Second window for the hard cancel to take effect.
+        if drain_queue $(( $(date +%s) + $(hard_cancel_window) )); then
+            drained=yes
+            echo "  Drain:      queue empty after hard cancel"
+        fi
+    fi
+
+    if [ "$drained" != yes ]; then
+        echo >&2
+        echo "  Queue still not empty: $(count_jobs) jobs remain." >&2
+        echo "  Sandboxes left intact -- jobs may still be staging output." >&2
+        echo "  Re-run '$PROG stop' once they clear to finish the sweep." >&2
+        return $EXIT_NOT_DRAINED
+    fi
+
+    # 7. Sweep, now that nothing is writing into the sandboxes.
+    if [ "$OPT_KEEP_SANDBOXES" = yes ]; then
+        echo "  Sandboxes:  kept $sandboxes directories (--keep-sandboxes)"
+    else
+        sweep_sandboxes || return $EXIT_RESIDUAL
+    fi
+
+    # 8. Report what was not cleaned up, rather than implying a clean sweep.
+    report_residuals "$killed"
+}
+
+# Read a knob out of blah.config.
+blah_config_value() {
+    local knob=$1 cfg="$BOSCO_DIR/glite/etc/blah.config"
+    [ -r "$cfg" ] || return 1
+    sed -n "s/^[[:space:]]*${knob}[[:space:]]*=[[:space:]]*//p" "$cfg" \
+        | tail -n 1 | tr -d '"' | tr -d "'"
+}
+
+# Worker-node directories this command cannot reach. Stated plainly: the whole
+# cleanup strategy is signal discipline, and signal discipline has known holes.
+report_residuals() {
+    local killed=$1
+    if [ "$killed" -eq 0 ]; then
+        return $EXIT_OK
+    fi
+
+    # With blah_run_in_workdir=yes the wrapper sets new_home to the job's
+    # workdir on the shared filesystem and its cleanup deliberately does not
+    # rm -rf, because there is no separate temp directory. Nothing is stranded
+    # on the worker node; the sandbox sweep above already reclaimed it.
+    if [ "$(blah_config_value blah_run_in_workdir 2>/dev/null)" = "yes" ]; then
+        echo >&2
+        echo "  Note:       $killed jobs ignored SIGTERM and were killed outright," >&2
+        echo "              but blah_run_in_workdir=yes means they ran in their" >&2
+        echo "              sandbox directories, which the sweep above reclaimed." >&2
+        return $EXIT_OK
+    fi
+    echo >&2
+    echo "  Residual:   $killed jobs ignored SIGTERM and were killed outright." >&2
+    echo "              Their worker-node working directories were NOT removed," >&2
+    echo "              because the cleanup trap never ran to completion." >&2
+    echo "              Directories on node-local scratch (blah_wn_temporary_home_dir)" >&2
+    echo "              and directories on nodes that died are likewise unreachable" >&2
+    echo "              from this host and are not counted above." >&2
+    return $EXIT_RESIDUAL
+}
+
+# --- lockout ----------------------------------------------------------------
+
+# Comment out every active key. On a dedicated account (assumption A1) they all
+# belong to the CE. Commenting rather than deleting keeps resume exact.
+disable_ssh_keys() {
+    local n tmp
+    if [ ! -f "$AUTHORIZED_KEYS" ]; then
+        echo "  SSH:        cannot lock out -- $AUTHORIZED_KEYS does not exist." >&2
+        echo "              If keys are managed elsewhere (LDAP, SSSD), disable" >&2
+        echo "              this account's access there instead." >&2
+        return 1
+    fi
+    if [ ! -r "$AUTHORIZED_KEYS" ] || [ ! -w "$AUTHORIZED_KEYS" ]; then
+        echo "  SSH:        cannot lock out -- $AUTHORIZED_KEYS is not readable and writable." >&2
+        return 1
+    fi
+
+    n=$(grep -c '^[^#[:space:]]' "$AUTHORIZED_KEYS" 2>/dev/null || true)
+    if [ "$n" -eq 0 ]; then
+        echo "  SSH:        already locked out; no active keys to disable"
+        return 0
+    fi
+    if [ "$n" -gt 1 ]; then
+        echo "  SSH:        note -- disabling all $n keys in $AUTHORIZED_KEYS" >&2
+    fi
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null
+    cp "$AUTHORIZED_KEYS" "$KEY_BACKUP" || {
+        echo "  SSH:        cannot lock out -- failed to write backup $KEY_BACKUP" >&2
+        return 1
+    }
+    [ -s "$KEY_BACKUP" ] || {
+        echo "  SSH:        cannot lock out -- backup $KEY_BACKUP is empty" >&2
+        return 1
+    }
+
+    tmp=$(mktemp "${AUTHORIZED_KEYS}.ce_control.XXXXXX") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) printf '%s\n' "$line" ;;
+            *)       printf '%s\n%s\n' "$CE_KEY_MARKER" "#$line" ;;
+        esac
+    done < "$AUTHORIZED_KEYS" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$AUTHORIZED_KEYS" || return 1
+
+    echo "  SSH:        disabled $n keys (backup in $KEY_BACKUP)"
+    return 0
+}
+
+cmd_lockout() {
+    local stop_status
+
+    if [ "$OPT_DRY_RUN" = yes ]; then
+        cmd_stop
+        echo "  would disable all keys in $AUTHORIZED_KEYS (backup to $KEY_BACKUP)"
+        return $EXIT_OK
+    fi
+
+    cmd_stop
+    stop_status=$?
+
+    # A stop that could not drain means severing ssh turns the survivors into
+    # orphans the CE can never reap. Say so, and record them.
+    if [ "$stop_status" -eq $EXIT_NOT_DRAINED ]; then
+        local remaining
+        remaining=$(list_jobs)
+        echo >&2
+        echo "  WARNING:    the queue did not drain. Severing ssh now leaves these" >&2
+        echo "              jobs as orphans that the CE can never reap or clean up." >&2
+        mkdir -p "$STATE_DIR"
+        {
+            echo "# orphaned by ce_control lockout at $(date '+%Y-%m-%d %H:%M:%S %Z')"
+            printf '%s\n' "$remaining"
+        } >> "$STATE_DIR/last-run.log"
+        echo "              Job IDs recorded in $STATE_DIR/last-run.log" >&2
+        confirm "Sever ssh access anyway, orphaning those jobs?"
+    fi
+
+    disable_ssh_keys || return $EXIT_USAGE
+
+    # The CE can no longer clean up after itself, so sweep again.
+    if [ "$OPT_KEEP_SANDBOXES" != yes ] && [ "$stop_status" -ne $EXIT_NOT_DRAINED ]; then
+        sweep_sandboxes >/dev/null 2>&1
+    fi
+
+    [ "$stop_status" -eq $EXIT_OK ] && return $EXIT_OK
+    return $EXIT_RESIDUAL
+}
+
+# --- resume -----------------------------------------------------------------
+
+restore_ssh_keys() {
+    keys_are_locked || return 0
+
+    if [ ! -r "$KEY_BACKUP" ]; then
+        echo "  SSH:        keys are disabled but no backup exists at $KEY_BACKUP." >&2
+        echo "              Restore them by hand: remove the '$CE_KEY_MARKER'" >&2
+        echo "              lines from $AUTHORIZED_KEYS and uncomment the keys below them." >&2
+        return 1
+    fi
+    cp "$KEY_BACKUP" "$AUTHORIZED_KEYS" || {
+        echo "  SSH:        failed to restore $AUTHORIZED_KEYS from $KEY_BACKUP" >&2
+        return 1
+    }
+    chmod 600 "$AUTHORIZED_KEYS"
+    rm -f "$KEY_BACKUP"
+    echo "  SSH:        access restored from backup"
+    return 0
+}
+
+cmd_resume() {
+    local rc=$EXIT_OK
+
+    if [ "$OPT_DRY_RUN" = yes ]; then
+        echo "Dry run: nothing will be changed."
+        if [ -e "$STOP_FLAG" ]; then
+            echo "  would remove the stop flag $STOP_FLAG"
+        else
+            echo "  submissions are not blocked; nothing to unblock"
+        fi
+        if keys_are_locked; then
+            echo "  would restore $AUTHORIZED_KEYS from $KEY_BACKUP"
+        else
+            echo "  ssh access is already active"
+        fi
+        return $EXIT_OK
+    fi
+
+    confirm "Resume this CE: unblock submissions and restore ssh access?"
+
+    if [ -e "$STOP_FLAG" ]; then
+        rm -f "$STOP_FLAG" && echo "  Submissions: unblocked (removed $STOP_FLAG)"
+    else
+        echo "  Submissions: already unblocked"
+    fi
+
+    if keys_are_locked; then
+        restore_ssh_keys || rc=$EXIT_RESIDUAL
+    else
+        echo "  SSH:        already active"
+    fi
+
+    return $rc
+}
+
+# --- argument parsing -------------------------------------------------------
+
+OPT_MESSAGE=""
+OPT_GRACE=120
+OPT_DRY_RUN=no
+OPT_YES=no
+OPT_KEEP_SANDBOXES=no
+
+COMMAND=""
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)    usage; exit $EXIT_OK ;;
+            -m|--message) [ $# -ge 2 ] || die "--message requires an argument"
+                          OPT_MESSAGE="$2"; shift 2 ;;
+            -g|--grace)   [ $# -ge 2 ] || die "--grace requires an argument"
+                          case "$2" in
+                              ''|*[!0-9]*) die "--grace requires a number of seconds" ;;
+                          esac
+                          OPT_GRACE="$2"; shift 2 ;;
+            -n|--dry-run) OPT_DRY_RUN=yes; shift ;;
+            -y|--yes)     OPT_YES=yes; shift ;;
+            --keep-sandboxes) OPT_KEEP_SANDBOXES=yes; shift ;;
+            status|stop|lockout|resume)
+                          [ -z "$COMMAND" ] || die "only one command may be given"
+                          COMMAND="$1"; shift ;;
+            -*)           usage >&2; die "unknown option: $1" ;;
+            *)            usage >&2; die "unknown command: $1" ;;
+        esac
+    done
+    [ -n "$COMMAND" ] || COMMAND=status
+}
+
+main() {
+    parse_args "$@"
+
+    # status is read-only, and a dry run changes nothing, so neither should
+    # contend for the lock or block a real run in progress.
+    if [ "$COMMAND" != status ] && [ "$OPT_DRY_RUN" != yes ]; then
+        acquire_lock
+    fi
+
+    case "$COMMAND" in
+        status)  cmd_status ;;
+        stop)    cmd_stop ;;
+        lockout) cmd_lockout ;;
+        resume)  cmd_resume ;;
+        *)       die "not implemented yet: $COMMAND" ;;
+    esac
+}
+
+main "$@"

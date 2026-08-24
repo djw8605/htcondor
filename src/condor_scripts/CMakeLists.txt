@@ -49,6 +49,9 @@ if (NOT WINDOWS)
     install ( FILES condor_remote_cluster DESTINATION ${C_BIN} PERMISSIONS ${CONDOR_SCRIPT_PERMS} )
     install ( FILES condor_join_pool DESTINATION ${C_BIN} PERMISSIONS ${CONDOR_SCRIPT_PERMS} )
     clone_install( condor_remote_cluster "${C_BIN}" bosco_cluster "${C_BIN}" )
+    # Pushed to the remote cluster by condor_remote_cluster; installed here so
+    # it sits next to it and can also be copied to a site by hand.
+    install ( FILES ce_control DESTINATION ${C_BIN} PERMISSIONS ${CONDOR_SCRIPT_PERMS} )
     install ( FILES condor_ssh_start DESTINATION ${C_BIN} PERMISSIONS ${CONDOR_SCRIPT_PERMS} )
     install ( FILES condor_upgrade_check DESTINATION ${C_BIN} PERMISSIONS ${CONDOR_SCRIPT_PERMS} )
 
